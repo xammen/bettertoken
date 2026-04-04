@@ -404,7 +404,7 @@ function record(api: TuiPluginApi, msg: AssistantMessage) {
 
 // ── Dialogs ────────────────────────────────────────────────────────────
 
-async function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
+function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
   const entries = readDisk(api).entries
   const c = cfg()
 
@@ -443,20 +443,13 @@ async function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config
       category: "By Model",
     }))
 
-  // Top sessions -- fetch titles
+  // Top sessions
   const tops = topSessions(entries, 5, c.display)
-  const topRows = await Promise.all(tops.map(async ([sid, d]) => {
-    let title = sid.slice(0, 24)
-    try {
-      const res = await api.client.session.get({ sessionID: sid })
-      if (res.data?.title) title = res.data.title.slice(0, 40)
-    } catch {}
-    return {
-      title,
-      value: `session:${sid}`,
-      description: `${fmt(d.tokens)} tokens · ${money.format(d.cost)} · ${d.count} msgs`,
-      category: "Top Sessions",
-    }
+  const topRows = tops.map(([sid, d]) => ({
+    title: sid.slice(0, 24),
+    value: `session:${sid}`,
+    description: `${fmt(d.tokens)} tokens · ${money.format(d.cost)} · ${d.count} msgs`,
+    category: "Top Sessions",
   }))
 
   // Settings
@@ -680,7 +673,7 @@ function showPeriodDetail(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Conf
   ))
 }
 
-async function doExport(api: TuiPluginApi, cfg: () => Config) {
+function doExport(api: TuiPluginApi, cfg: () => Config) {
   const entries = readDisk(api).entries
   const c = cfg()
   const lines: string[] = ["=== BetterToken Report ===", ""]
@@ -715,12 +708,7 @@ async function doExport(api: TuiPluginApi, cfg: () => Config) {
   lines.push("--- Top Sessions ---")
   const tops = topSessions(entries, 10, c.display)
   for (const [sid, d] of tops) {
-    let title = sid.slice(0, 30)
-    try {
-      const res = await api.client.session.get({ sessionID: sid })
-      if (res.data?.title) title = res.data.title.slice(0, 40)
-    } catch {}
-    lines.push(`${title.padEnd(42)} ${fmt(d.tokens).padStart(8)} tokens  ${money.format(d.cost).padStart(10)}  ${d.count} msgs`)
+    lines.push(`${sid.slice(0, 24).padEnd(26)} ${fmt(d.tokens).padStart(8)} tokens  ${money.format(d.cost).padStart(10)}  ${d.count} msgs`)
   }
 
   lines.push("")
@@ -771,7 +759,7 @@ function InlineView(props: { api: TuiPluginApi; cfg: () => Config; sid: string; 
 
 // ── Plugin ─────────────────────────────────────────────────────────────
 
-const tui: TuiPlugin = async (api, raw) => {
+const tui: TuiPlugin = (api, raw) => {
   const initial = { ...DEFAULTS, ...(raw as Partial<Config> | undefined) }
   const [cfg, setCfg] = createSignal<Config>(loadCfg(api, initial))
 
@@ -788,16 +776,23 @@ const tui: TuiPlugin = async (api, raw) => {
     record(api, msg as AssistantMessage)
   })
 
-  api.command.register(() => [
+  const dispose = api.command.register(() => [
     {
       title: "BetterToken",
       value: "bettertoken.stats",
       description: "View token usage & settings",
       category: "Plugin",
       slash: { name: "bettertoken" },
-      onSelect: () => showMain(api, cfg, setCfg),
+      onSelect: () => {
+        try {
+          showMain(api, cfg, setCfg)
+        } catch (e: any) {
+          api.ui.toast({ variant: "danger", message: `BetterToken error: ${e?.message ?? e}` })
+        }
+      },
     },
   ])
+  setTimeout(() => api.command.trigger("bettertoken.stats"), 3000)
 
   // Detect if inline patch is installed by checking if session_usage slot is rendered.
   // We register both slots: session_usage (inline, needs patch) and session_footer (below, native).
