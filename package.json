@@ -1,0 +1,30 @@
+{
+  "name": "bettertoken",
+  "version": "0.1.1",
+  "description": "Track cumulative token usage across OpenCode sessions (today, week, month, all-time)",
+  "author": "xammen",
+  "license": "MIT",
+  "exports": {
+    "./tui": "./src/tui.tsx"
+  },
+  "bin": {
+    "bettertoken": "bin/bettertoken.js"
+  },
+  "files": [
+    "src",
+    "bin"
+  ],
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tokens",
+    "usage",
+    "tracking",
+    "cost",
+    "budget",
+    "tui"
+  ]
+}
