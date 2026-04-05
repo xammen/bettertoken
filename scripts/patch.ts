@@ -5,15 +5,19 @@
  * Idempotent: safe to run multiple times. Detects if already patched.
  *
  * Usage:
- *   bun run patch.ts [--undo]
+ *   bun run patch.ts              # Apply BetterToken patch
+ *   bun run patch.ts --undo       # Remove BetterToken patch
+ *   bun run patch.ts --uninstall-tps  # Remove TPS meter and restore stock OpenCode
  */
 
 import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
+import { execSync } from "node:child_process"
 
 const MARKER = "bettertoken-patch"
 const UNDO = process.argv.includes("--undo")
+const UNINSTALL_TPS = process.argv.includes("--uninstall-tps")
 
 // ── Find OpenCode installation ────────────────────────────────────────
 
@@ -155,7 +159,101 @@ $2`)
 
 // undoPatch is handled by restoring from backup in main()
 
+// ── Uninstall TPS meter ───────────────────────────────────────────────
+
+function uninstallTpsMeter() {
+  console.log("")
+  console.log("  Uninstalling opencode-tps-meter...")
+  console.log("")
+
+  const home = os.homedir()
+  const isWin = process.platform === "win32"
+  const isMac = process.platform === "darwin"
+
+  // Find TPS meter install root
+  const tpsRoot = isWin
+    ? path.join(home, "AppData", "Local", "opencode-tps-meter")
+    : path.join(process.env.XDG_DATA_HOME || path.join(home, ".local", "share"), "opencode-tps-meter")
+
+  if (!fs.existsSync(tpsRoot)) {
+    console.log("  opencode-tps-meter is not installed.")
+    process.exit(0)
+  }
+
+  console.log(`  Found TPS meter at: ${tpsRoot}`)
+
+  if (isWin) {
+    // Windows: TPS meter uses npm/bun global or a custom launcher
+    // Check common wrapper locations
+    const candidates = [
+      path.join(home, "AppData", "Roaming", "npm", "opencode.cmd"),
+      path.join(home, "AppData", "Roaming", "npm", "opencode"),
+      path.join(home, ".bun", "bin", "opencode"),
+      path.join(home, ".bun", "bin", "opencode.exe"),
+    ]
+
+    // Check if any wrapper points to tps-meter
+    for (const wrapper of candidates) {
+      try {
+        if (fs.existsSync(wrapper)) {
+          const content = fs.readFileSync(wrapper, "utf-8")
+          if (content.includes("opencode-tps-meter")) {
+            // Check for stock backup
+            const stockPath = wrapper.replace(/opencode(\.\w+)?$/, "opencode-stock$1")
+            if (fs.existsSync(stockPath)) {
+              fs.copyFileSync(stockPath, wrapper)
+              fs.unlinkSync(stockPath)
+              console.log(`  Restored stock OpenCode: ${wrapper}`)
+            } else {
+              fs.unlinkSync(wrapper)
+              console.log(`  Removed TPS meter wrapper: ${wrapper}`)
+            }
+          }
+        }
+      } catch {}
+    }
+  } else {
+    // Linux/Mac: wrapper at ~/.local/bin/opencode, stock at ~/.local/bin/opencode-stock
+    const binDir = path.join(home, ".local", "bin")
+    const wrapper = path.join(binDir, "opencode")
+    const stock = path.join(binDir, "opencode-stock")
+
+    if (fs.existsSync(stock)) {
+      fs.renameSync(stock, wrapper)
+      console.log("  Restored stock OpenCode from opencode-stock")
+    } else if (fs.existsSync(wrapper)) {
+      try {
+        const content = fs.readFileSync(wrapper, "utf-8")
+        if (content.includes("opencode-tps-meter")) {
+          fs.unlinkSync(wrapper)
+          console.log("  Removed TPS meter wrapper (no stock backup found)")
+          console.log("  You may need to reinstall OpenCode: npm i -g opencode-ai")
+        }
+      } catch {}
+    }
+  }
+
+  // Remove TPS meter directory
+  try {
+    fs.rmSync(tpsRoot, { recursive: true, force: true })
+    console.log(`  Removed: ${tpsRoot}`)
+  } catch (e: any) {
+    console.error(`  Could not remove ${tpsRoot}: ${e.message}`)
+    console.error("  Try closing OpenCode first, then run this again.")
+  }
+
+  console.log("")
+  console.log("  opencode-tps-meter uninstalled.")
+  console.log("  Run 'opencode' to verify stock OpenCode works.")
+  console.log("")
+}
+
 // ── Main ──────────────────────────────────────────────────────────────
+
+if (UNINSTALL_TPS) {
+  uninstallTpsMeter()
+  process.exit(0)
+}
 
 console.log("")
 console.log("  BetterToken Patcher")
