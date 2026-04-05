@@ -9,6 +9,7 @@ import {
   showMain,
   refreshTitles,
   cacheTitle,
+  setPatchInstalled,
   FooterView,
   InlineView,
 } from "./logic"
@@ -27,6 +28,7 @@ const tui: TuiPlugin = (api, raw) => {
       value: "bettertoken.stats",
       description: "View token usage & settings",
       category: "Plugin",
+      slash: { name: "bettertoken" },
       onSelect: () => {
         try {
           showMain(api, cfg, setCfg, tick)
@@ -54,14 +56,30 @@ const tui: TuiPlugin = (api, raw) => {
     if (typeof process !== "undefined" && process.argv[1]) {
       const fs = require("node:fs")
       const path = require("node:path")
-      const srcRoot = path.resolve(path.dirname(process.argv[1]), "..")
-      const promptFile = path.join(srcRoot, "packages", "opencode", "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx")
-      try {
-        const src = fs.readFileSync(promptFile, "utf-8")
-        if (src.includes('name="session_usage"')) patchInstalled = true
-      } catch {}
+      // argv[1] is like .../packages/opencode/src/index.ts
+      // We need to go up to the release root, then into the prompt component
+      const argv1Dir = path.dirname(process.argv[1])
+      const candidates = [
+        path.resolve(argv1Dir, "cli", "cmd", "tui", "component", "prompt", "index.tsx"),
+        path.resolve(argv1Dir, "..", "cli", "cmd", "tui", "component", "prompt", "index.tsx"),
+        path.resolve(argv1Dir, "..", "..", "..", "packages", "opencode", "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx"),
+      ]
+      for (const candidate of candidates) {
+        try {
+          const src = fs.readFileSync(candidate, "utf-8")
+          if (src.includes('name="session_usage"')) { patchInstalled = true; break }
+        } catch {}
+      }
     }
   } catch {}
+
+  // Inform logic of patch status
+  setPatchInstalled(patchInstalled)
+
+  // Warn if inline placement but no patch
+  if (!patchInstalled && cfg().placement === "inline") {
+    api.ui.toast({ variant: "warning", message: "BetterToken: inline mode requires patched OpenCode. Falling back to sidebar.", duration: 5000 })
+  }
 
   api.slots.register({
     slots: {
@@ -72,15 +90,19 @@ const tui: TuiPlugin = (api, raw) => {
       },
       sidebar_footer() {
         const p = cfg().placement
-        if (p !== "sidebar" && p !== "footer") return null
-        return <FooterView api={api} cfg={cfg} tick={tick} />
+        // Show in sidebar for: sidebar mode, footer mode, or inline fallback when no patch
+        if (p === "sidebar" || p === "footer") return <FooterView api={api} cfg={cfg} tick={tick} />
+        if (p === "inline" && !patchInstalled) return <FooterView api={api} cfg={cfg} tick={tick} />
+        return null
       },
       session_footer() {
-        if (cfg().placement !== "footer") return null
-        return <FooterView api={api} cfg={cfg} tick={tick} />
+        const p = cfg().placement
+        if (p === "footer") return <FooterView api={api} cfg={cfg} tick={tick} />
+        if (p === "inline" && !patchInstalled) return <FooterView api={api} cfg={cfg} tick={tick} />
+        return null
       },
       session_usage(_ctx: any, props: any) {
-        if (cfg().placement !== "inline") return null
+        if (cfg().placement !== "inline" || !patchInstalled) return null
         return <InlineView api={api} cfg={cfg} sid={props.session_id} tick={tick} />
       },
     } as any,

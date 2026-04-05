@@ -240,6 +240,11 @@ function saveCfg(api: TuiPluginApi, cfg: Config) { api.kv.set(KV_CFG, cfg) }
 // Title cache - populated by sidebar_title slot and async lookups
 const titleCache = new Map<string, string>()
 
+// Patch status - set by tui.tsx
+let _patchInstalled = false
+export function setPatchInstalled(v: boolean) { _patchInstalled = v }
+export function isPatchInstalled() { return _patchInstalled }
+
 export function cacheTitle(sid: string, title: string) {
   if (sid && title) titleCache.set(sid, title)
 }
@@ -355,7 +360,15 @@ export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Confi
       { title: `Reset data (${entries.length})`, value: "action:reset", description: "", category: "Actions" },
     ]
 
-    return [...lines, ...modelRows, ...recentRows, ...topRows, ...settings]
+    // Patch banner
+    const banner = !_patchInstalled ? [{
+      title: "Patch OpenCode for inline mode",
+      value: "action:patch",
+      description: "Click to copy install command",
+      category: "Info",
+    }] : []
+
+    return [...banner, ...lines, ...modelRows, ...recentRows, ...topRows, ...settings]
   }
 
   // Refresh titles in background each time dashboard opens
@@ -369,6 +382,16 @@ export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Confi
       onSelect={(item: any) => {
         const v = item.value as string
         if (v === "noop") return showMain(api, cfg, setCfg, tick)
+        if (v === "action:patch") {
+          const isWin = process.platform === "win32"
+          const cmd = isWin
+            ? 'irm https://raw.githubusercontent.com/xammen/bettertoken/main/install.ps1 | iex'
+            : 'curl -fsSL https://raw.githubusercontent.com/xammen/bettertoken/main/install.sh | bash'
+          const b64 = Buffer.from(cmd).toString("base64")
+          process.stdout.write(`\x1b]52;c;${b64}\x07`)
+          api.ui.toast({ variant: "success", message: "Install command copied to clipboard! Paste in terminal and restart OpenCode." })
+          return showMain(api, cfg, setCfg, tick)
+        }
         if (v === "cfg:display") return showDisplayPicker(api, cfg, setCfg, tick)
         if (v === "cfg:show_cost") { const n = { ...cfg(), show_cost: !cfg().show_cost }; setCfg(n); saveCfg(api, n); return showMain(api, cfg, setCfg, tick) }
         if (v === "cfg:compact") { const n = { ...cfg(), compact: !cfg().compact }; setCfg(n); saveCfg(api, n); return showMain(api, cfg, setCfg, tick) }
@@ -421,17 +444,29 @@ function showPeriodPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Conf
 
 function showPlacementPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
   const placements: Placement[] = ["inline", "footer", "sidebar"]
-  const labels: Record<Placement, string> = { inline: "Inline (next to TPS · context)", footer: "Footer (line below TPS)", sidebar: "Sidebar only" }
+  const labels: Record<Placement, string> = {
+    inline: _patchInstalled ? "Inline (next to TPS)" : "Inline (requires patch)",
+    footer: "Footer (line below TPS)",
+    sidebar: "Sidebar only",
+  }
   api.ui.dialog.replace(() => (
     <api.ui.DialogSelect
       title="Placement"
       options={[
-        ...placements.map((p) => ({ title: `${p === cfg().placement ? "[x]" : "[ ]"} ${labels[p]}`, value: p })),
+        ...placements.map((p) => ({
+          title: `${p === cfg().placement ? "[x]" : "[ ]"} ${labels[p]}`,
+          value: p,
+          description: p === "inline" && !_patchInstalled ? "Falls back to sidebar" : "",
+        })),
         { title: "<- Back", value: "back" },
       ]}
       onSelect={(item: any) => {
         if (item.value === "back") return showMain(api, cfg, setCfg, tick)
-        const n = { ...cfg(), placement: item.value as Placement }; setCfg(n); saveCfg(api, n); api.ui.toast({ variant: "success", message: `Placement: ${labels[item.value as Placement]}` }); showMain(api, cfg, setCfg, tick)
+        const p = item.value as Placement
+        if (p === "inline" && !_patchInstalled) {
+          api.ui.toast({ variant: "warning", message: "Inline requires patched OpenCode. Stats will show in sidebar." })
+        }
+        const n = { ...cfg(), placement: p }; setCfg(n); saveCfg(api, n); showMain(api, cfg, setCfg, tick)
       }}
     />
   ))
@@ -506,13 +541,23 @@ export function FooterView(props: { api: TuiPluginApi; cfg: () => Config; tick: 
   return <text fg={data().over ? "#EF4444" : theme().textMuted} wrapMode="none">{data().over ? "! " : ""}{data().text}</text>
 }
 
+function sessionCost(api: TuiPluginApi, sid: string): string {
+  try {
+    if (!sid) return ""
+    const msgs = api.state.session.messages(sid)
+    const cost = msgs.reduce((s, m) => s + (m.role === "assistant" ? (m as any).cost || 0 : 0), 0)
+    return cost > 0 ? money.format(cost) : ""
+  } catch { return "" }
+}
+
 export function InlineView(props: { api: TuiPluginApi; cfg: () => Config; sid: string; tick: () => number }) {
   const data = createMemo(() => {
     props.tick()
     const entries = readDisk(props.api).entries, c = props.cfg()
     const ctx = contextInfo(props.api, props.sid)
+    const cost = sessionCost(props.api, props.sid)
     const stats = formatStats(entries, c)
-    const parts = [ctx, stats].filter(Boolean)
+    const parts = [ctx, cost, stats].filter(Boolean)
     return { text: parts.join(" · "), over: checkBudget(entries, c).over }
   })
   return <span style={data().over ? { fg: "#EF4444" } : {}}>{" · " + (data().over ? "! " : "") + data().text}</span>
