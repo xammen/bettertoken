@@ -136,26 +136,30 @@ function topSessions(entries: Entry[], limit: number, mode: Display) {
 // ── Context % ─────────────────────────────────────────────────────────
 
 function contextInfo(api: TuiPluginApi, sid?: string): string {
-  if (!sid) {
-    const route = api.route.current
-    if (route.name !== "session") return ""
-    sid = (route as any).params?.sessionID as string | undefined
-    if (!sid) return ""
+  try {
+    if (!sid) {
+      const route = api.route.current
+      if (route.name !== "session") return ""
+      sid = (route as any).params?.sessionID as string | undefined
+      if (!sid) return ""
+    }
+    const msgs = api.state.session.messages(sid)
+    const last = msgs.findLast(
+      (m): m is AssistantMessage => m.role === "assistant" && m.tokens.output > 0
+    )
+    if (!last) return ""
+    const total = last.tokens.input + last.tokens.output + last.tokens.reasoning
+      + last.tokens.cache.read + last.tokens.cache.write
+    if (total <= 0) return ""
+    const providers = api.state.provider
+    if (!providers) return fmt(total)
+    const model = providers.find((p) => p.id === last.providerID)?.models[last.modelID]
+    if (!model?.limit?.context) return fmt(total)
+    const pct = Math.round((total / model.limit.context) * 100)
+    return `${fmt(total)} (${pct}%)`
+  } catch {
+    return ""
   }
-  const msgs = api.state.session.messages(sid)
-  const last = msgs.findLast(
-    (m): m is AssistantMessage => m.role === "assistant" && m.tokens.output > 0
-  )
-  if (!last) return ""
-  const total = last.tokens.input + last.tokens.output + last.tokens.reasoning
-    + last.tokens.cache.read + last.tokens.cache.write
-  if (total <= 0) return ""
-  const model = api.state.provider
-    .find((p) => p.id === last.providerID)
-    ?.models[last.modelID]
-  if (!model?.limit.context) return fmt(total)
-  const pct = Math.round((total / model.limit.context) * 100)
-  return `${fmt(total)} (${pct}%)`
 }
 
 // ── Cost estimation ───────────────────────────────────────────────────
@@ -236,10 +240,6 @@ function saveCfg(api: TuiPluginApi, cfg: Config) { api.kv.set(KV_CFG, cfg) }
 // Title cache - populated by sidebar_title slot and async lookups
 const titleCache = new Map<string, string>()
 
-function getSessionTitle(sid: string): string | undefined {
-  return titleCache.get(sid)
-}
-
 export function cacheTitle(sid: string, title: string) {
   if (sid && title) titleCache.set(sid, title)
 }
@@ -292,7 +292,9 @@ export async function refreshTitles(api: TuiPluginApi) {
 
 export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
   function buildOptions() {
-    const entries = readDisk(api).entries
+    const store = readDisk(api)
+    const entries = store.entries
+    const diskTitles = store.titles || {}
     const c = cfg()
     if (tick) tick() // subscribe to reactive tick for live updates
 
@@ -317,7 +319,6 @@ export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Confi
     }))
 
     // Sessions
-    const diskTitles = readDisk(api).titles || {}
     const sesMap = new Map<string, { tokens: number; cost: number; count: number; lastTs: number }>()
     for (const e of entries) {
       const sid = e.sid || "unknown"
@@ -374,58 +375,10 @@ export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Confi
         if (v === "cfg:periods") return showPeriodPicker(api, cfg, setCfg, tick)
         if (v === "cfg:budget_menu") return showBudgetMenu(api, cfg, setCfg, tick)
         if (v === "cfg:placement") return showPlacementPicker(api, cfg, setCfg, tick)
-        if (v === "action:reset") return showResetConfirm(api, cfg, setCfg)
+        if (v === "action:reset") return showResetConfirm(api, cfg, setCfg, tick)
         if (v === "action:export") return doExport(api, cfg)
 
         showMain(api, cfg, setCfg, tick)
-      }}
-    />
-  ))
-}
-
-function showToggleMenu(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
-  const c = cfg()
-  api.ui.dialog.replace(() => (
-    <api.ui.DialogSelect
-      title="Toggles"
-      options={[
-        { title: `Show cost: ${c.show_cost ? "On" : "Off"}`, value: "cost" },
-        { title: `Compact: ${c.compact ? "On" : "Off"}`, value: "compact" },
-        { title: "<- Back", value: "back" },
-      ]}
-      onSelect={(item: any) => {
-        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
-        if (item.value === "cost") { const n = { ...cfg(), show_cost: !cfg().show_cost }; setCfg(n); saveCfg(api, n); return showToggleMenu(api, cfg, setCfg, tick) }
-        if (item.value === "compact") { const n = { ...cfg(), compact: !cfg().compact }; setCfg(n); saveCfg(api, n); return showToggleMenu(api, cfg, setCfg, tick) }
-      }}
-    />
-  ))
-}
-
-function showPeriodsAndBudget(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
-  const c = cfg()
-  const periodOpts = ALL_PERIODS.map((p) => ({ title: `${c.footer_periods.includes(p) ? "[x]" : "[ ]"} ${periodLabel(p)}`, value: `p:${p}` }))
-  const budgetOpts = [
-    { title: `Budget: ${c.budget.enabled ? "On" : "Off"}`, value: "budget:toggle" },
-    ...(c.budget.enabled ? [
-      { title: `  Daily tokens: ${c.budget.daily_tokens ? fmt(c.budget.daily_tokens) : "Off"}`, value: "budget:daily_tokens" },
-      { title: `  Monthly tokens: ${c.budget.monthly_tokens ? fmt(c.budget.monthly_tokens) : "Off"}`, value: "budget:monthly_tokens" },
-    ] : []),
-  ]
-  api.ui.dialog.replace(() => (
-    <api.ui.DialogSelect
-      title="Periods & Budget"
-      options={[...periodOpts, ...budgetOpts, { title: "<- Back", value: "back" }]}
-      onSelect={(item: any) => {
-        const v = item.value as string
-        if (v === "back") return showMain(api, cfg, setCfg, tick)
-        if (v.startsWith("p:")) {
-          const p = v.slice(2) as Period
-          const periods = c.footer_periods.includes(p) ? c.footer_periods.filter((x) => x !== p) : [...c.footer_periods, p]
-          const n = { ...c, footer_periods: periods }; setCfg(n); saveCfg(api, n); return showPeriodsAndBudget(api, cfg, setCfg, tick)
-        }
-        if (v === "budget:toggle") { const n = { ...cfg(), budget: { ...cfg().budget, enabled: !cfg().budget.enabled } }; setCfg(n); saveCfg(api, n); return showPeriodsAndBudget(api, cfg, setCfg, tick) }
-        if (v.startsWith("budget:")) return promptBudget(api, cfg, setCfg, v.replace("budget:", ""), tick)
       }}
     />
   ))
@@ -519,7 +472,7 @@ function promptBudget(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) 
   ))
 }
 
-function showResetConfirm(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
+function showResetConfirm(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
   api.ui.dialog.replace(() => (
     <api.ui.DialogConfirm
       title="Reset all data?"
