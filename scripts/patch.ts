@@ -75,8 +75,10 @@ function getPromptPath(root: string): string {
 
 // ── Patch logic ───────────────────────────────────────────────────────
 
-function isPatched(src: string): boolean {
-  return src.includes(MARKER) || src.includes('name="session_usage"')
+function patchSource(src: string): "bettertoken" | "tps-meter" | "none" {
+  if (src.includes(MARKER)) return "bettertoken"
+  if (src.includes('name="session_usage"')) return "tps-meter"
+  return "none"
 }
 
 function applyPatch(src: string): string {
@@ -151,22 +153,7 @@ $2`)
   return src
 }
 
-function undoPatch(src: string): string {
-  // Remove bettertoken-patch markers and slot additions
-  // This is a best-effort removal
-
-  // Remove session_usage slot block
-  src = src.replace(/\s*\{\/\*\s*bettertoken-patch\s*\*\/\}\s*\n\s*<TuiPluginRuntime\.Slot name="session_usage"[^]*?<\/TuiPluginRuntime\.Slot>/g, "")
-
-  // Remove session_footer slot block
-  src = src.replace(/\s*\{\/\*\s*bettertoken-patch-footer\s*\*\/\}\s*\n\s*<Show when=\{props\.sessionID\}>\s*\n\s*\{[^}]*<TuiPluginRuntime\.Slot name="session_footer"[^/]*\/>\}\s*\n\s*<\/Show>/g, "")
-
-  // Restore original context/cost join if it was replaced
-  // This is tricky - if we broke the original pattern, we might not be able to restore it perfectly
-  // Best approach: check if the original pattern is still intact
-
-  return src
-}
+// undoPatch is handled by restoring from backup in main()
 
 // ── Main ──────────────────────────────────────────────────────────────
 
@@ -198,22 +185,40 @@ if (!fs.existsSync(promptPath)) {
 
 const original = fs.readFileSync(promptPath, "utf-8")
 
+const source = patchSource(original)
+
 if (UNDO) {
-  if (!isPatched(original)) {
+  if (source === "none") {
     console.log("  Not patched, nothing to undo.")
     process.exit(0)
   }
-  const restored = undoPatch(original)
-  // Backup first
-  fs.writeFileSync(promptPath + ".bettertoken-backup", original)
-  fs.writeFileSync(promptPath, restored)
-  console.log("  Patch removed. Backup saved as .bettertoken-backup")
-  console.log("  Restart OpenCode to apply changes.")
+  if (source === "tps-meter") {
+    console.log("  This patch was applied by opencode-tps-meter, not BetterToken.")
+    console.log("  To remove it, use the TPS meter uninstaller:")
+    console.log("    curl -fsSL https://raw.githubusercontent.com/guard22/opencode-tps-meter/main/uninstall.sh | bash")
+    console.log("")
+    console.log("  Or on Windows:")
+    console.log("    irm https://raw.githubusercontent.com/guard22/opencode-tps-meter/main/uninstall.ps1 | iex")
+    process.exit(0)
+  }
+  // source === "bettertoken" → restore from backup
+  const backupPath = promptPath + ".bettertoken-backup"
+  if (fs.existsSync(backupPath)) {
+    const backup = fs.readFileSync(backupPath, "utf-8")
+    fs.writeFileSync(promptPath, backup)
+    fs.unlinkSync(backupPath)
+    console.log("  Patch removed (restored from backup).")
+    console.log("  Restart OpenCode to apply changes.")
+  } else {
+    console.log("  No backup file found. Cannot safely restore.")
+    console.log("  You may need to reinstall OpenCode to remove the patch.")
+  }
   process.exit(0)
 }
 
-if (isPatched(original)) {
-  console.log("  Already patched (session_usage slot found).")
+if (source !== "none") {
+  const who = source === "bettertoken" ? "BetterToken" : "opencode-tps-meter"
+  console.log(`  Already patched by ${who} (session_usage slot found).`)
   console.log("  Nothing to do. Use --undo to remove the patch.")
   process.exit(0)
 }
