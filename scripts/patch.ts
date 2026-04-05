@@ -168,7 +168,6 @@ function uninstallTpsMeter() {
 
   const home = os.homedir()
   const isWin = process.platform === "win32"
-  const isMac = process.platform === "darwin"
 
   // Find TPS meter install root
   const tpsRoot = isWin
@@ -182,55 +181,80 @@ function uninstallTpsMeter() {
 
   console.log(`  Found TPS meter at: ${tpsRoot}`)
 
-  if (isWin) {
-    // Windows: TPS meter uses npm/bun global or a custom launcher
-    // Check common wrapper locations
-    const candidates = [
-      path.join(home, "AppData", "Roaming", "npm", "opencode.cmd"),
-      path.join(home, "AppData", "Roaming", "npm", "opencode"),
-      path.join(home, ".bun", "bin", "opencode"),
-      path.join(home, ".bun", "bin", "opencode.exe"),
-    ]
+  // Find and restore ALL wrapper scripts that point to tps-meter
+  const wrapperCandidates = isWin
+    ? [
+        path.join(home, ".opencode", "bin", "opencode.ps1"),
+        path.join(home, ".opencode", "bin", "opencode.cmd"),
+        path.join(home, "AppData", "Roaming", "npm", "opencode.cmd"),
+        path.join(home, "AppData", "Roaming", "npm", "opencode.ps1"),
+        path.join(home, ".bun", "bin", "opencode"),
+        path.join(home, ".bun", "bin", "opencode.cmd"),
+      ]
+    : [
+        path.join(home, ".local", "bin", "opencode"),
+        path.join(home, ".opencode", "bin", "opencode"),
+      ]
 
-    // Check if any wrapper points to tps-meter
-    for (const wrapper of candidates) {
-      try {
-        if (fs.existsSync(wrapper)) {
-          const content = fs.readFileSync(wrapper, "utf-8")
-          if (content.includes("opencode-tps-meter")) {
-            // Check for stock backup
-            const stockPath = wrapper.replace(/opencode(\.\w+)?$/, "opencode-stock$1")
-            if (fs.existsSync(stockPath)) {
-              fs.copyFileSync(stockPath, wrapper)
-              fs.unlinkSync(stockPath)
-              console.log(`  Restored stock OpenCode: ${wrapper}`)
-            } else {
-              fs.unlinkSync(wrapper)
-              console.log(`  Removed TPS meter wrapper: ${wrapper}`)
-            }
-          }
-        }
-      } catch {}
-    }
-  } else {
-    // Linux/Mac: wrapper at ~/.local/bin/opencode, stock at ~/.local/bin/opencode-stock
-    const binDir = path.join(home, ".local", "bin")
-    const wrapper = path.join(binDir, "opencode")
-    const stock = path.join(binDir, "opencode-stock")
+  let restored = 0
+  for (const wrapper of wrapperCandidates) {
+    try {
+      if (!fs.existsSync(wrapper)) continue
+      const content = fs.readFileSync(wrapper, "utf-8")
+      if (!content.includes("opencode-tps-meter")) continue
 
-    if (fs.existsSync(stock)) {
-      fs.renameSync(stock, wrapper)
-      console.log("  Restored stock OpenCode from opencode-stock")
-    } else if (fs.existsSync(wrapper)) {
-      try {
-        const content = fs.readFileSync(wrapper, "utf-8")
-        if (content.includes("opencode-tps-meter")) {
-          fs.unlinkSync(wrapper)
-          console.log("  Removed TPS meter wrapper (no stock backup found)")
-          console.log("  You may need to reinstall OpenCode: npm i -g opencode-ai")
+      // This wrapper was modified by TPS meter - restore it
+      const dir = path.dirname(wrapper)
+      const ext = path.extname(wrapper)
+
+      // Find the stock opencode binary in the same directory
+      const stockBinary = fs.readdirSync(dir).find(f =>
+        f.startsWith("opencode") && (f.endsWith(".exe") || (!ext && !f.includes("."))) && !f.includes("stock") && !f.includes("tps") && f !== path.basename(wrapper)
+      )
+
+      if (ext === ".ps1") {
+        // Restore PowerShell wrapper to just call the exe
+        fs.writeFileSync(wrapper, `& "$PSScriptRoot\\opencode.exe" @args\n`)
+        console.log(`  Restored: ${wrapper}`)
+        restored++
+      } else if (ext === ".cmd") {
+        // Restore CMD wrapper to just call the exe
+        fs.writeFileSync(wrapper, `@echo off\n"%~dp0opencode.exe" %*\n`)
+        console.log(`  Restored: ${wrapper}`)
+        restored++
+      } else {
+        // Unix shell script - check for stock backup
+        const stockPath = path.join(dir, "opencode-stock")
+        if (fs.existsSync(stockPath)) {
+          fs.renameSync(stockPath, wrapper)
+          console.log(`  Restored from opencode-stock: ${wrapper}`)
+          restored++
+        } else {
+          // Point to the exe/binary in the same dir
+          fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${dir}/opencode.exe" "$@"\n`)
+          fs.chmodSync(wrapper, 0o755)
+          console.log(`  Restored: ${wrapper}`)
+          restored++
         }
-      } catch {}
+      }
+    } catch (e: any) {
+      console.warn(`  Could not restore ${wrapper}: ${e.message}`)
     }
+  }
+
+  if (restored === 0) {
+    console.log("  No TPS meter wrappers found to restore.")
+  }
+
+  // Clean up stock backup files
+  for (const wrapper of wrapperCandidates) {
+    const dir = path.dirname(wrapper)
+    try {
+      const stockExe = path.join(dir, "opencode-stock.exe")
+      const stockBin = path.join(dir, "opencode-stock")
+      if (fs.existsSync(stockExe)) { fs.unlinkSync(stockExe); console.log(`  Removed backup: ${stockExe}`) }
+      if (fs.existsSync(stockBin)) { fs.unlinkSync(stockBin); console.log(`  Removed backup: ${stockBin}`) }
+    } catch {}
   }
 
   // Remove TPS meter directory
