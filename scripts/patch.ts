@@ -15,7 +15,18 @@ import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { execSync } from "node:child_process"
-import { SUPPORTED_VERSIONS, LATEST_SUPPORTED, isSupported, resolve, printSupported } from "./manifest"
+
+// ── Manifest (inlined to avoid import issues when run from temp) ──────
+
+const SUPPORTED_VERSIONS: Record<string, { tag: string; patch: string }> = {
+  "1.3.13": { tag: "v1.3.13", patch: "opencode-1.3.13.patch" },
+  "1.3.14": { tag: "v1.3.14", patch: "opencode-1.3.13.patch" },
+  "1.3.15": { tag: "v1.3.15", patch: "opencode-1.3.13.patch" },
+}
+const LATEST_SUPPORTED = "1.3.13"
+function isSupported(v: string) { return v in SUPPORTED_VERSIONS }
+function resolve(v: string) { return SUPPORTED_VERSIONS[v] }
+function printSupported() { return Object.keys(SUPPORTED_VERSIONS).join(", ") }
 
 const UPSTREAM_REPO = "https://github.com/anomalyco/opencode.git"
 const PATCHES_URL = "https://raw.githubusercontent.com/xammen/bettertoken/main/patches"
