@@ -1,120 +1,76 @@
 /** @jsxImportSource @opentui/solid */
-import type {
-  TuiPlugin,
-  TuiPluginApi,
-  TuiPluginModule,
-} from "@opencode-ai/plugin/tui"
+import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
-import { createMemo, createSignal } from "solid-js"
+import { createMemo } from "solid-js"
 import path from "node:path"
 import fs from "node:fs"
 
 // ── Types ──────────────────────────────────────────────────────────────
 
 type Entry = {
-  ts: number
-  sid: string
-  model: string
-  provider: string
-  input: number
-  output: number
-  reasoning: number
-  cache_read: number
-  cache_write: number
-  cost: number
+  ts: number; sid: string; model: string; provider: string
+  input: number; output: number; reasoning: number
+  cache_read: number; cache_write: number; cost: number
 }
 
 type Display = "total" | "output" | "input" | "cache" | "all"
 type Period = "today" | "yesterday" | "week" | "month" | "all"
 
 type Budget = {
-  enabled: boolean
-  daily_tokens: number   // 0 = no limit
-  daily_cost: number     // 0 = no limit
-  monthly_tokens: number // 0 = no limit
-  monthly_cost: number   // 0 = no limit
+  enabled: boolean; daily_tokens: number; daily_cost: number
+  monthly_tokens: number; monthly_cost: number
 }
+
+type Placement = "inline" | "footer" | "sidebar"
 
 export type Config = {
-  display: Display
-  show_cost: boolean
-  compact: boolean
-  footer_periods: Period[]
-  budget: Budget
+  display: Display; show_cost: boolean; compact: boolean
+  footer_periods: Period[]; budget: Budget; placement: Placement
 }
 
-type Store = {
-  entries: Entry[]
-  seen: string[]
-}
+type Store = { entries: Entry[]; seen: string[]; titles?: Record<string, string> }
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 const KV_CFG = "bettertoken.config"
 const FILENAME = "bettertoken.json"
 const ALL_PERIODS: Period[] = ["today", "yesterday", "week", "month", "all"]
-const BACK = { title: "<- Back", value: "back", description: "" }
 const EMPTY: Store = { entries: [], seen: [] }
 const SPARKS = [" ", "\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"]
 
-const NO_BUDGET: Budget = {
-  enabled: false,
-  daily_tokens: 0,
-  daily_cost: 0,
-  monthly_tokens: 0,
-  monthly_cost: 0,
-}
+const NO_BUDGET: Budget = { enabled: false, daily_tokens: 0, daily_cost: 0, monthly_tokens: 0, monthly_cost: 0 }
 
 export const DEFAULTS: Config = {
-  display: "total",
-  show_cost: true,
-  compact: false,
-  footer_periods: ["today", "month"],
-  budget: NO_BUDGET,
+  display: "total", show_cost: true, compact: false,
+  footer_periods: ["today", "month"], budget: NO_BUDGET, placement: "inline",
 }
+
+const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 })
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-function dayStart(date: Date): number {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
-}
+function dayStart(d: Date) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() }
 
-function startOf(period: Period): number {
+function startOf(p: Period): number {
   const now = new Date()
-  if (period === "today") return dayStart(now)
-  if (period === "yesterday") {
-    const y = new Date(now)
-    y.setDate(y.getDate() - 1)
-    return dayStart(y)
-  }
-  if (period === "week") {
-    const day = now.getDay()
-    const diff = day === 0 ? 6 : day - 1
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate() - diff).getTime()
-  }
+  if (p === "today") return dayStart(now)
+  if (p === "yesterday") { const y = new Date(now); y.setDate(y.getDate() - 1); return dayStart(y) }
+  if (p === "week") { const day = now.getDay(); return new Date(now.getFullYear(), now.getMonth(), now.getDate() - (day === 0 ? 6 : day - 1)).getTime() }
   return new Date(now.getFullYear(), now.getMonth(), 1).getTime()
 }
 
-function endOf(period: Period): number | undefined {
-  if (period === "yesterday") return startOf("today")
-  return undefined
-}
+function endOf(p: Period): number | undefined { return p === "yesterday" ? startOf("today") : undefined }
 
-function tok(e: Entry, mode: Display): number {
-  if (mode === "output") return e.output
-  if (mode === "input") return e.input
-  if (mode === "cache") return e.cache_read + e.cache_write
-  if (mode === "all") return e.input + e.output + e.reasoning + e.cache_read + e.cache_write
+function tok(e: Entry, m: Display): number {
+  if (m === "output") return e.output
+  if (m === "input") return e.input
+  if (m === "cache") return e.cache_read + e.cache_write
+  if (m === "all") return e.input + e.output + e.reasoning + e.cache_read + e.cache_write
   return e.input + e.output + e.reasoning + e.cache_write
 }
 
-function aggregate(entries: Entry[], mode: Display): number {
-  return entries.reduce((s, e) => s + tok(e, mode), 0)
-}
-
-function sumCost(entries: Entry[]): number {
-  return entries.reduce((s, e) => s + e.cost, 0)
-}
+function agg(entries: Entry[], m: Display) { return entries.reduce((s, e) => s + tok(e, m), 0) }
+function sumC(entries: Entry[]) { return entries.reduce((s, e) => s + e.cost, 0) }
 
 function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -122,32 +78,16 @@ function fmt(n: number): string {
   return `${n}`
 }
 
-const money = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 4,
-})
-
 function periodLabel(p: string, compact = false): string {
-  if (compact) {
-    if (p === "today") return "T"
-    if (p === "yesterday") return "Y"
-    if (p === "week") return "W"
-    if (p === "month") return "M"
-    return "All"
-  }
-  if (p === "today") return "Today"
-  if (p === "yesterday") return "Yesterday"
-  if (p === "week") return "Week"
-  if (p === "month") return "Month"
-  return "All-time"
+  const labels: any = compact
+    ? { today: "T", yesterday: "Y", week: "W", month: "M", all: "All" }
+    : { today: "Today", yesterday: "Yesterday", week: "Week", month: "Month", all: "All-time" }
+  return labels[p] || p
 }
 
-function periodFilter(entries: Entry[], period: string): Entry[] {
-  if (period === "all") return entries
-  const cutoff = startOf(period as Period)
-  const cap = endOf(period as Period)
+function periodFilter(entries: Entry[], p: string): Entry[] {
+  if (p === "all") return entries
+  const cutoff = startOf(p as Period), cap = endOf(p as Period)
   return entries.filter((e) => e.ts >= cutoff && (cap === undefined || e.ts < cap))
 }
 
@@ -162,9 +102,7 @@ function displayLabel(d: Display): string {
 function formatStats(entries: Entry[], cfg: Config): string {
   const sep = cfg.compact ? "|" : " | "
   return cfg.footer_periods.map((p) => {
-    const f = periodFilter(entries, p)
-    const t = aggregate(f, cfg.display)
-    const co = sumCost(f)
+    const f = periodFilter(entries, p), t = agg(f, cfg.display), co = sumC(f)
     const lbl = periodLabel(p, cfg.compact)
     let text = cfg.compact ? `${lbl}:${fmt(t)}` : `${lbl}: ${fmt(t)}`
     if (cfg.show_cost && co > 0) text += ` ${money.format(co)}`
@@ -172,52 +110,27 @@ function formatStats(entries: Entry[], cfg: Config): string {
   }).join(sep)
 }
 
-// ── Sparkline (last 7 days) ───────────────────────────────────────────
-
 function sparkline(entries: Entry[], mode: Display): string {
-  const now = new Date()
-  const days: number[] = []
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(now)
-    d.setDate(d.getDate() - i)
-    const start = dayStart(d)
-    const end = start + 86400000
-    const total = entries
-      .filter((e) => e.ts >= start && e.ts < end)
-      .reduce((s, e) => s + tok(e, mode), 0)
-    days.push(total)
-  }
-  const max = Math.max(...days, 1)
-  return days.map((v) => SPARKS[Math.round((v / max) * 8)]).join("")
+  const now = new Date(), days: number[] = []
+  for (let i = 6; i >= 0; i--) { const d = new Date(now); d.setDate(d.getDate() - i); const s = dayStart(d); days.push(entries.filter((e) => e.ts >= s && e.ts < s + 864e5).reduce((a, e) => a + tok(e, mode), 0)) }
+  const mx = Math.max(...days, 1)
+  return days.map((v) => SPARKS[Math.round((v / mx) * 8)]).join("")
 }
-
-// ── Daily average ─────────────────────────────────────────────────────
 
 function dailyAvg(entries: Entry[], mode: Display): string {
-  if (entries.length === 0) return "0"
+  if (!entries.length) return "0"
   const sorted = [...entries].sort((a, b) => a.ts - b.ts)
-  const first = dayStart(new Date(sorted[0].ts))
-  const last = dayStart(new Date())
-  const days = Math.max(1, Math.round((last - first) / 86400000) + 1)
-  const total = aggregate(entries, mode)
-  return fmt(Math.round(total / days))
+  const days = Math.max(1, Math.round((dayStart(new Date()) - dayStart(new Date(sorted[0].ts))) / 864e5) + 1)
+  return fmt(Math.round(agg(entries, mode) / days))
 }
-
-// ── Top sessions ──────────────────────────────────────────────────────
 
 function topSessions(entries: Entry[], limit: number, mode: Display) {
   const map = new Map<string, { tokens: number; cost: number; count: number }>()
   for (const e of entries) {
-    const sid = e.sid || "unknown"
-    const cur = map.get(sid) ?? { tokens: 0, cost: 0, count: 0 }
-    cur.tokens += tok(e, mode)
-    cur.cost += e.cost
-    cur.count++
-    map.set(sid, cur)
+    const sid = e.sid || "unknown", cur = map.get(sid) ?? { tokens: 0, cost: 0, count: 0 }
+    cur.tokens += tok(e, mode); cur.cost += e.cost; cur.count++; map.set(sid, cur)
   }
-  return [...map.entries()]
-    .sort((a, b) => b[1].tokens - a[1].tokens)
-    .slice(0, limit)
+  return [...map.entries()].sort((a, b) => b[1].tokens - a[1].tokens).slice(0, limit)
 }
 
 // ── Context % ─────────────────────────────────────────────────────────
@@ -249,73 +162,41 @@ function contextInfo(api: TuiPluginApi, sid?: string): string {
 
 function estimateCost(api: TuiPluginApi, msg: AssistantMessage): number {
   if (msg.cost > 0) return msg.cost
-  const model = api.state.provider
-    .find((p) => p.id === msg.providerID)
-    ?.models[msg.modelID]
+  const model = api.state.provider.find((p) => p.id === msg.providerID)?.models[msg.modelID]
   if (!model?.cost) return 0
   const c = model.cost as { input: number; output: number; cache?: { read: number; write: number } }
   return (
-    (msg.tokens.input * (c.input ?? 0)) / 1_000_000 +
-    (msg.tokens.output * (c.output ?? 0)) / 1_000_000 +
-    (msg.tokens.reasoning * (c.output ?? 0)) / 1_000_000 +
-    (msg.tokens.cache.read * (c.cache?.read ?? 0)) / 1_000_000 +
-    (msg.tokens.cache.write * (c.cache?.write ?? 0)) / 1_000_000
+    (msg.tokens.input * (c.input ?? 0)) / 1e6 +
+    (msg.tokens.output * (c.output ?? 0)) / 1e6 +
+    (msg.tokens.reasoning * (c.output ?? 0)) / 1e6 +
+    (msg.tokens.cache.read * (c.cache?.read ?? 0)) / 1e6 +
+    (msg.tokens.cache.write * (c.cache?.write ?? 0)) / 1e6
   )
 }
 
 // ── Budget check ──────────────────────────────────────────────────────
 
-type BudgetStatus = { over: boolean; warnings: string[] }
-
-function checkBudget(entries: Entry[], cfg: Config): BudgetStatus {
+function checkBudget(entries: Entry[], cfg: Config): { over: boolean; warnings: string[] } {
   const b = cfg.budget
   if (!b.enabled) return { over: false, warnings: [] }
   const warnings: string[] = []
   let over = false
-
-  const todayEntries = periodFilter(entries, "today")
-  const monthEntries = periodFilter(entries, "month")
-  const todayTok = aggregate(todayEntries, cfg.display)
-  const todayCost = sumCost(todayEntries)
-  const monthTok = aggregate(monthEntries, cfg.display)
-  const monthCost = sumCost(monthEntries)
-
-  if (b.daily_tokens > 0 && todayTok >= b.daily_tokens) {
-    over = true
-    warnings.push(`Daily tokens: ${fmt(todayTok)}/${fmt(b.daily_tokens)}`)
-  }
-  if (b.daily_cost > 0 && todayCost >= b.daily_cost) {
-    over = true
-    warnings.push(`Daily cost: ${money.format(todayCost)}/${money.format(b.daily_cost)}`)
-  }
-  if (b.monthly_tokens > 0 && monthTok >= b.monthly_tokens) {
-    over = true
-    warnings.push(`Monthly tokens: ${fmt(monthTok)}/${fmt(b.monthly_tokens)}`)
-  }
-  if (b.monthly_cost > 0 && monthCost >= b.monthly_cost) {
-    over = true
-    warnings.push(`Monthly cost: ${money.format(monthCost)}/${money.format(b.monthly_cost)}`)
-  }
-
+  const td = periodFilter(entries, "today"), md = periodFilter(entries, "month")
+  if (b.daily_tokens > 0 && agg(td, cfg.display) >= b.daily_tokens) { over = true; warnings.push(`Daily tokens: ${fmt(agg(td, cfg.display))}/${fmt(b.daily_tokens)}`) }
+  if (b.daily_cost > 0 && sumC(td) >= b.daily_cost) { over = true; warnings.push(`Daily cost: ${money.format(sumC(td))}/${money.format(b.daily_cost)}`) }
+  if (b.monthly_tokens > 0 && agg(md, cfg.display) >= b.monthly_tokens) { over = true; warnings.push(`Monthly tokens: ${fmt(agg(md, cfg.display))}/${fmt(b.monthly_tokens)}`) }
+  if (b.monthly_cost > 0 && sumC(md) >= b.monthly_cost) { over = true; warnings.push(`Monthly cost: ${money.format(sumC(md))}/${money.format(b.monthly_cost)}`) }
   return { over, warnings }
 }
 
-// ── OSC52 clipboard ───────────────────────────────────────────────────
-
-function copyToClipboard(text: string) {
-  const b64 = Buffer.from(text).toString("base64")
-  process.stdout.write(`\x1b]52;c;${b64}\x07`)
-}
-
-// ── File-based data store ─────────────────────────────────────────────
+// ── File store ────────────────────────────────────────────────────────
 
 let dataPath = ""
 let cachedStore: Store = EMPTY
 let cachedMtime = 0
-let writing = false
-const MAX_AGE_MS = 90 * 86400000 // 90 days
+const MAX_AGE_MS = 90 * 864e5
 
-function resolveDataPath(api: TuiPluginApi): string {
+function resolvePath(api: TuiPluginApi): string {
   if (dataPath) return dataPath
   const dir = api.state.path.state
   if (!dir) return ""
@@ -324,41 +205,24 @@ function resolveDataPath(api: TuiPluginApi): string {
 }
 
 function readDisk(api: TuiPluginApi): Store {
-  const p = resolveDataPath(api)
+  const p = resolvePath(api)
   if (!p) return EMPTY
   try {
     const stat = fs.statSync(p)
-    const mtime = stat.mtimeMs
-    // Only re-read if file changed since last read
-    if (mtime === cachedMtime && cachedStore !== EMPTY) return cachedStore
+    if (stat.mtimeMs === cachedMtime && cachedStore !== EMPTY) return cachedStore
     const raw = JSON.parse(fs.readFileSync(p, "utf-8"))
-    if (raw && Array.isArray(raw.entries)) {
-      cachedStore = { entries: raw.entries, seen: raw.seen ?? [] }
-      cachedMtime = mtime
-      return cachedStore
-    }
+    if (raw && Array.isArray(raw.entries)) { cachedStore = { entries: raw.entries, seen: raw.seen ?? [], titles: raw.titles ?? {} }; cachedMtime = stat.mtimeMs; return cachedStore }
   } catch {}
   return EMPTY
 }
 
 function writeDisk(api: TuiPluginApi, store: Store) {
-  const p = resolveDataPath(api)
+  const p = resolvePath(api)
   if (!p) return
-  // Prune entries older than 90 days
   const cutoff = Date.now() - MAX_AGE_MS
   const pruned = store.entries.filter((e) => e.ts >= cutoff)
-  const seenSet = new Set(store.seen)
-  // Only keep seen IDs that match remaining entries (cleanup)
-  const prunedSeen = pruned.map((e) => e.sid).length > 0
-    ? store.seen.filter((id) => seenSet.has(id)).slice(-5000)
-    : store.seen.slice(-5000)
-  const bounded = { entries: pruned, seen: prunedSeen }
-  try {
-    fs.writeFileSync(p, JSON.stringify(bounded), "utf-8")
-    // Update cache immediately after write
-    cachedStore = bounded
-    cachedMtime = fs.statSync(p).mtimeMs
-  } catch {}
+  const bounded: Store = { entries: pruned, seen: store.seen.slice(-5000), titles: store.titles || {} }
+  try { fs.writeFileSync(p, JSON.stringify(bounded), "utf-8"); cachedStore = bounded; cachedMtime = fs.statSync(p).mtimeMs } catch {}
 }
 
 export function loadCfg(api: TuiPluginApi, initial: Config): Config {
@@ -367,265 +231,290 @@ export function loadCfg(api: TuiPluginApi, initial: Config): Config {
   return { ...initial, ...raw }
 }
 
-function saveCfg(api: TuiPluginApi, cfg: Config) {
-  api.kv.set(KV_CFG, cfg)
+function saveCfg(api: TuiPluginApi, cfg: Config) { api.kv.set(KV_CFG, cfg) }
+
+// Title cache - populated by sidebar_title slot and async lookups
+const titleCache = new Map<string, string>()
+
+function getSessionTitle(sid: string): string | undefined {
+  return titleCache.get(sid)
+}
+
+export function cacheTitle(sid: string, title: string) {
+  if (sid && title) titleCache.set(sid, title)
 }
 
 export function record(api: TuiPluginApi, msg: AssistantMessage) {
-  // Force fresh read from disk (bypass mtime cache) to merge with other sessions
-  const p = resolveDataPath(api)
+  const p = resolvePath(api)
   if (!p) return
   let store: Store = EMPTY
-  try {
-    const raw = JSON.parse(fs.readFileSync(p, "utf-8"))
-    if (raw && Array.isArray(raw.entries)) store = { entries: raw.entries, seen: raw.seen ?? [] }
-  } catch {}
-  // Use Set for O(1) dedup check
-  const seenSet = new Set(store.seen)
-  if (seenSet.has(msg.id)) return
+  try { const raw = JSON.parse(fs.readFileSync(p, "utf-8")); if (raw?.entries) store = { entries: raw.entries, seen: raw.seen ?? [], titles: raw.titles ?? {} } } catch {}
+  if (new Set(store.seen).has(msg.id)) return
   const entry: Entry = {
-    ts: msg.time.completed ?? msg.time.created,
-    sid: msg.sessionID,
-    model: msg.modelID,
-    provider: msg.providerID,
-    input: msg.tokens.input,
-    output: msg.tokens.output,
-    reasoning: msg.tokens.reasoning,
-    cache_read: msg.tokens.cache.read,
-    cache_write: msg.tokens.cache.write,
+    ts: msg.time.completed ?? msg.time.created, sid: msg.sessionID,
+    model: msg.modelID, provider: msg.providerID,
+    input: msg.tokens.input, output: msg.tokens.output, reasoning: msg.tokens.reasoning,
+    cache_read: msg.tokens.cache.read, cache_write: msg.tokens.cache.write,
     cost: estimateCost(api, msg),
   }
-  const next: Store = {
-    entries: [...store.entries, entry],
-    seen: [...store.seen, msg.id],
-  }
-  writeDisk(api, next)
+  // Save cached titles to disk
+  const titles = { ...(store.titles || {}) }
+  for (const [sid, t] of titleCache) { if (!titles[sid]) titles[sid] = t }
+  writeDisk(api, { entries: [...store.entries, entry], seen: [...store.seen, msg.id], titles })
+}
+
+// ── Title refresh ─────────────────────────────────────────────────────
+
+export async function refreshTitles(api: TuiPluginApi) {
+  try {
+    const store = readDisk(api)
+    const titles = { ...(store.titles || {}) }
+
+    // Load disk cache into memory
+    for (const [sid, t] of Object.entries(titles)) { titleCache.set(sid, t) }
+
+    // Fetch all sessions from client
+    const res = await api.client.session.list() as any
+    const sessions = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+    let changed = false
+    for (const s of sessions) {
+      if (s.id && s.title && !titles[s.id]) {
+        titles[s.id] = s.title
+        titleCache.set(s.id, s.title)
+        changed = true
+      }
+    }
+    if (changed) writeDisk(api, { ...store, titles })
+  } catch {}
 }
 
 // ── Dialogs ────────────────────────────────────────────────────────────
 
-export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
-  const entries = readDisk(api).entries
-  const c = cfg()
+export function showMain(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  function buildOptions() {
+    const entries = readDisk(api).entries
+    const c = cfg()
+    if (tick) tick() // subscribe to reactive tick for live updates
 
-  // Usage periods
-  const lines = ALL_PERIODS.map((p) => {
-    const f = periodFilter(entries, p)
-    const t = aggregate(f, c.display)
-    const co = sumCost(f)
-    const desc = co > 0 ? `${fmt(t)} tokens · ${money.format(co)}` : `${fmt(t)} tokens`
-    return { title: periodLabel(p), value: `period:${p}`, description: desc, category: "Usage" }
-  })
+    // Usage: all periods + daily avg
+    const lines = ALL_PERIODS.map((p) => {
+      const f = periodFilter(entries, p), t = agg(f, c.display), co = sumC(f)
+      const costStr = co > 0 ? ` · ${money.format(co)}` : ""
+      return { title: periodLabel(p), value: `period:${p}`, description: `${fmt(t)}${costStr}`, category: "Usage" }
+    })
+    lines.push({ title: `Daily avg: ${dailyAvg(entries, c.display)}/day`, value: "noop", description: sparkline(entries, c.display), category: "Usage" })
 
-  // Stats
-  const avg = dailyAvg(entries, c.display)
-  const spark = sparkline(entries, c.display)
-  const stats = [
-    { title: `Daily avg: ${avg}/day`, value: "noop", description: `Last 7 days: ${spark}`, category: "Stats" },
-  ]
-
-  // Models
-  const models = new Map<string, { input: number; output: number; cost: number }>()
-  for (const e of entries) {
-    const key = `${e.provider}/${e.model}`
-    const cur = models.get(key) ?? { input: 0, output: 0, cost: 0 }
-    cur.input += e.input
-    cur.output += e.output
-    cur.cost += e.cost
-    models.set(key, cur)
-  }
-  const modelRows = [...models.entries()]
-    .sort((a, b) => b[1].cost - a[1].cost)
-    .map(([name, d]) => ({
-      title: name,
-      value: `model:${name}`,
-      description: `in: ${fmt(d.input)} · out: ${fmt(d.output)} · ${money.format(d.cost)}`,
-      category: "By Model",
+    // Models: top 3
+    const models = new Map<string, { total: number; cost: number; count: number }>()
+    for (const e of entries) {
+      const k = e.model || "unknown"
+      const cur = models.get(k) ?? { total: 0, cost: 0, count: 0 }
+      cur.total += tok(e, c.display); cur.cost += e.cost; cur.count++
+      models.set(k, cur)
+    }
+    const modelRows = [...models.entries()].sort((a, b) => b[1].total - a[1].total).slice(0, 3).map(([name, d]) => ({
+      title: name, value: `model:${name}`, description: `${fmt(d.total)} · ${d.count} msgs`, category: "Models",
     }))
 
-  // Top sessions
-  const tops = topSessions(entries, 5, c.display)
-  const topRows = tops.map(([sid, d]) => ({
-    title: sid.slice(0, 24),
-    value: `session:${sid}`,
-    description: `${fmt(d.tokens)} tokens · ${money.format(d.cost)} · ${d.count} msgs`,
-    category: "Top Sessions",
-  }))
+    // Sessions
+    const diskTitles = readDisk(api).titles || {}
+    const sesMap = new Map<string, { tokens: number; cost: number; count: number; lastTs: number }>()
+    for (const e of entries) {
+      const sid = e.sid || "unknown"
+      const cur = sesMap.get(sid) ?? { tokens: 0, cost: 0, count: 0, lastTs: 0 }
+      cur.tokens += tok(e, c.display); cur.cost += e.cost; cur.count++
+      if (e.ts > cur.lastTs) cur.lastTs = e.ts
+      sesMap.set(sid, cur)
+    }
+    const allSessions = [...sesMap.entries()].filter(([sid]) => sid && sid !== "unknown" && sid !== "")
 
-  // Settings
-  const settings = [
-    { title: "Display mode", value: "cfg:display", description: displayLabel(c.display), category: "Settings" },
-    { title: "Show cost in footer", value: "cfg:show_cost", description: c.show_cost ? "Yes" : "No", category: "Settings" },
-    { title: "Compact mode", value: "cfg:compact", description: c.compact ? "On (T: W: M:)" : "Off (Today: Week: Month:)", category: "Settings" },
-    { title: "Footer periods", value: "cfg:periods", description: c.footer_periods.map((p) => periodLabel(p)).join(", "), category: "Settings" },
-    { title: "Budget alerts", value: "cfg:budget", description: c.budget.enabled ? budgetSummary(c.budget) : "Off", category: "Settings" },
-  ]
+    function sesTitle(sid: string) {
+      let title = titleCache.get(sid) || diskTitles[sid] || sid.slice(0, 20)
+      if (title.length > 36) title = title.slice(0, 33) + "..."
+      return title
+    }
 
-  // Actions
-  const actions = [
-    { title: "Export to clipboard", value: "action:export", description: "Copy full report as text", category: "Actions" },
-    { title: "Reset all data", value: "action:reset", description: `${entries.length} entries stored`, category: "Actions" },
-    { title: patchInstalled ? "Inline patch installed" : "Install inline patch", value: "action:patch_info", description: patchInstalled ? "Stats show next to TPS" : "Run: bettertoken patch", category: "Actions" },
-  ]
+    function sesRow(sid: string, d: any, cat: string) {
+      return { title: sesTitle(sid), value: `session:${sid}`, description: `${fmt(d.tokens)} · ${d.count} msgs`, category: cat }
+    }
+
+    const recentRows = [...allSessions].sort((a, b) => b[1].lastTs - a[1].lastTs).slice(0, 3).map(([sid, d]) => sesRow(sid, d, "Recent"))
+    const recentSids = new Set(recentRows.map(r => r.value.replace("session:", "")))
+    const topRows = [...allSessions].sort((a, b) => b[1].tokens - a[1].tokens).filter(([sid]) => !recentSids.has(sid)).slice(0, 3).map(([sid, d]) => sesRow(sid, d, "Top"))
+
+    const placementLabel = { inline: "Inline", footer: "Footer", sidebar: "Sidebar" }[c.placement] || c.placement
+    const settings = [
+      { title: "Display mode", value: "cfg:display", description: displayLabel(c.display), category: "Settings" },
+      { title: "Show cost in footer", value: "cfg:show_cost", description: c.show_cost ? "On" : "Off", category: "Settings" },
+      { title: "Compact mode", value: "cfg:compact", description: c.compact ? "On" : "Off", category: "Settings" },
+      { title: "Placement", value: "cfg:placement", description: placementLabel, category: "Settings" },
+      { title: "Periods", value: "cfg:periods", description: c.footer_periods.map((p) => periodLabel(p)).join(", "), category: "Settings" },
+      { title: "Budget alerts", value: "cfg:budget_menu", description: c.budget.enabled ? "On" : "Off", category: "Settings" },
+      { title: "Export report", value: "action:export", description: "", category: "Actions" },
+      { title: `Reset data (${entries.length})`, value: "action:reset", description: "", category: "Actions" },
+    ]
+
+    return [...lines, ...modelRows, ...recentRows, ...topRows, ...settings]
+  }
+
+  // Refresh titles in background each time dashboard opens
+  refreshTitles(api).catch(() => {})
 
   api.ui.dialog.setSize("large")
-  setTimeout(() => {
-    api.ui.dialog.replace(() => (
-      <api.ui.DialogSelect
-        title="BetterToken"
-        options={[...lines, ...stats, ...modelRows, ...topRows, ...settings, ...actions]}
-        onSelect={(item) => {
-          const v = item.value as string
-          if (v === "noop") return showMain(api, cfg, setCfg)
-          if (v === "cfg:display") return showDisplayPicker(api, cfg, setCfg)
-          if (v === "cfg:show_cost") {
-            const next = { ...cfg(), show_cost: !cfg().show_cost }
-            setCfg(next)
-            saveCfg(api, next)
-            api.ui.toast({ variant: "success", message: `Show cost: ${next.show_cost ? "Yes" : "No"}` })
-            return showMain(api, cfg, setCfg)
-          }
-          if (v === "cfg:compact") {
-            const next = { ...cfg(), compact: !cfg().compact }
-            setCfg(next)
-            saveCfg(api, next)
-            api.ui.toast({ variant: "success", message: next.compact ? "Compact mode on" : "Compact mode off" })
-            return showMain(api, cfg, setCfg)
-          }
-          if (v === "cfg:budget") return showBudgetMenu(api, cfg, setCfg)
-          if (v === "cfg:periods") return showPeriodPicker(api, cfg, setCfg)
-          if (v === "action:reset") return showResetConfirm(api, cfg, setCfg)
-          if (v === "action:export") return doExport(api, cfg)
-          if (v === "action:patch_info") {
-            const msg = patchInstalled
-              ? "Inline patch is installed. Stats appear next to TPS and context %.\n\nTo remove: run 'bettertoken unpatch' in your terminal."
-              : "Inline patch is not installed. Stats appear below the footer.\n\nTo install: run 'bettertoken patch' in your terminal.\nThen restart OpenCode."
-            api.ui.dialog.replace(() => (
-              <api.ui.DialogAlert
-                title="BetterToken > Inline Patch"
-                message={msg}
-                onConfirm={() => showMain(api, cfg, setCfg)}
-              />
-            ))
-            return
-          }
-          if (v.startsWith("period:")) return showPeriodDetail(api, cfg, setCfg, v.replace("period:", ""))
-          api.ui.dialog.clear()
-        }}
-      />
-    ))
-  }, 0)
-}
-
-function showDisplayPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
-  const modes: Display[] = ["total", "output", "input", "cache", "all"]
-  const options = modes.map((m) => ({
-    title: m.charAt(0).toUpperCase() + m.slice(1),
-    value: m,
-    description: displayLabel(m),
-  }))
-
-  api.ui.dialog.replace(() => (
-    <api.ui.DialogSelect<Display | "back">
-      title="BetterToken > Display Mode"
-      options={[BACK as any, ...options]}
-      current={cfg().display}
-      onSelect={(item) => {
-        if (item.value === "back") return showMain(api, cfg, setCfg)
-        const next = { ...cfg(), display: item.value as Display }
-        setCfg(next)
-        saveCfg(api, next)
-        api.ui.toast({ variant: "success", message: `Display: ${item.title}` })
-        showDisplayPicker(api, cfg, setCfg)
-      }}
-    />
-  ))
-}
-
-function showPeriodPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
-  const current = cfg().footer_periods
-  const options = ALL_PERIODS.map((p) => ({
-    title: `${current.includes(p) ? "[x] " : "[ ] "}${periodLabel(p)}`,
-    value: p,
-    description: current.includes(p) ? "Shown in footer" : "Hidden",
-  }))
-
-  api.ui.dialog.replace(() => (
-    <api.ui.DialogSelect<Period | "back">
-      title="BetterToken > Footer Periods"
-      options={[BACK as any, ...options]}
-      onSelect={(item) => {
-        if (item.value === "back") return showMain(api, cfg, setCfg)
-        const cur = cfg().footer_periods
-        const toggled = cur.includes(item.value as Period)
-          ? cur.filter((p) => p !== item.value)
-          : [...cur, item.value as Period]
-        const next = { ...cfg(), footer_periods: toggled.length > 0 ? toggled : ["today"] }
-        setCfg(next)
-        saveCfg(api, next)
-        showPeriodPicker(api, cfg, setCfg)
-      }}
-    />
-  ))
-}
-
-function budgetSummary(b: Budget): string {
-  const parts: string[] = []
-  if (b.daily_tokens > 0) parts.push(`${fmt(b.daily_tokens)}/day`)
-  if (b.daily_cost > 0) parts.push(`${money.format(b.daily_cost)}/day`)
-  if (b.monthly_tokens > 0) parts.push(`${fmt(b.monthly_tokens)}/mo`)
-  if (b.monthly_cost > 0) parts.push(`${money.format(b.monthly_cost)}/mo`)
-  return parts.length > 0 ? parts.join(", ") : "No limits set"
-}
-
-function showBudgetMenu(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
-  const b = cfg().budget
-  const options = [
-    BACK,
-    { title: "Budget alerts", value: "toggle", description: b.enabled ? "On" : "Off" },
-    { title: "Daily token limit", value: "daily_tokens", description: b.daily_tokens > 0 ? fmt(b.daily_tokens) : "No limit" },
-    { title: "Daily cost limit", value: "daily_cost", description: b.daily_cost > 0 ? money.format(b.daily_cost) : "No limit" },
-    { title: "Monthly token limit", value: "monthly_tokens", description: b.monthly_tokens > 0 ? fmt(b.monthly_tokens) : "No limit" },
-    { title: "Monthly cost limit", value: "monthly_cost", description: b.monthly_cost > 0 ? money.format(b.monthly_cost) : "No limit" },
-  ]
-
   api.ui.dialog.replace(() => (
     <api.ui.DialogSelect
-      title="BetterToken > Budget"
-      options={options}
-      onSelect={(item) => {
-        if (item.value === "back") return showMain(api, cfg, setCfg)
-        if (item.value === "toggle") {
-          const next = { ...cfg(), budget: { ...cfg().budget, enabled: !cfg().budget.enabled } }
-          setCfg(next)
-          saveCfg(api, next)
-          api.ui.toast({ variant: "success", message: next.budget.enabled ? "Budget alerts on" : "Budget alerts off" })
-          return showBudgetMenu(api, cfg, setCfg)
-        }
-        // Prompt for a number
-        const field = item.value as keyof Budget
-        const isTokens = field.includes("tokens")
-        api.ui.dialog.replace(() => (
-          <api.ui.DialogPrompt
-            title={`BetterToken > Budget > ${item.title}`}
-            placeholder={isTokens ? "e.g. 500000 (0 = no limit)" : "e.g. 5.00 (0 = no limit)"}
-            value={String(b[field] ?? 0)}
-            onConfirm={(val) => {
-              const num = parseFloat(val) || 0
-              const next = { ...cfg(), budget: { ...cfg().budget, [field]: Math.max(0, num) } }
-              setCfg(next)
-              saveCfg(api, next)
-              api.ui.dialog.clear()
-              api.ui.toast({ variant: "success", message: `${item.title}: ${num > 0 ? (isTokens ? fmt(num) : money.format(num)) : "No limit"}` })
-              showBudgetMenu(api, cfg, setCfg)
-            }}
-            onCancel={() => {
-              api.ui.dialog.clear()
-              showBudgetMenu(api, cfg, setCfg)
-            }}
-          />
-        ))
+      title="BetterToken"
+      options={buildOptions()}
+      onSelect={(item: any) => {
+        const v = item.value as string
+        if (v === "noop") return showMain(api, cfg, setCfg, tick)
+        if (v === "cfg:display") return showDisplayPicker(api, cfg, setCfg, tick)
+        if (v === "cfg:show_cost") { const n = { ...cfg(), show_cost: !cfg().show_cost }; setCfg(n); saveCfg(api, n); return showMain(api, cfg, setCfg, tick) }
+        if (v === "cfg:compact") { const n = { ...cfg(), compact: !cfg().compact }; setCfg(n); saveCfg(api, n); return showMain(api, cfg, setCfg, tick) }
+        if (v === "cfg:periods") return showPeriodPicker(api, cfg, setCfg, tick)
+        if (v === "cfg:budget_menu") return showBudgetMenu(api, cfg, setCfg, tick)
+        if (v === "cfg:placement") return showPlacementPicker(api, cfg, setCfg, tick)
+        if (v === "action:reset") return showResetConfirm(api, cfg, setCfg)
+        if (v === "action:export") return doExport(api, cfg)
+
+        showMain(api, cfg, setCfg, tick)
       }}
+    />
+  ))
+}
+
+function showToggleMenu(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  const c = cfg()
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Toggles"
+      options={[
+        { title: `Show cost: ${c.show_cost ? "On" : "Off"}`, value: "cost" },
+        { title: `Compact: ${c.compact ? "On" : "Off"}`, value: "compact" },
+        { title: "<- Back", value: "back" },
+      ]}
+      onSelect={(item: any) => {
+        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
+        if (item.value === "cost") { const n = { ...cfg(), show_cost: !cfg().show_cost }; setCfg(n); saveCfg(api, n); return showToggleMenu(api, cfg, setCfg, tick) }
+        if (item.value === "compact") { const n = { ...cfg(), compact: !cfg().compact }; setCfg(n); saveCfg(api, n); return showToggleMenu(api, cfg, setCfg, tick) }
+      }}
+    />
+  ))
+}
+
+function showPeriodsAndBudget(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  const c = cfg()
+  const periodOpts = ALL_PERIODS.map((p) => ({ title: `${c.footer_periods.includes(p) ? "[x]" : "[ ]"} ${periodLabel(p)}`, value: `p:${p}` }))
+  const budgetOpts = [
+    { title: `Budget: ${c.budget.enabled ? "On" : "Off"}`, value: "budget:toggle" },
+    ...(c.budget.enabled ? [
+      { title: `  Daily tokens: ${c.budget.daily_tokens ? fmt(c.budget.daily_tokens) : "Off"}`, value: "budget:daily_tokens" },
+      { title: `  Monthly tokens: ${c.budget.monthly_tokens ? fmt(c.budget.monthly_tokens) : "Off"}`, value: "budget:monthly_tokens" },
+    ] : []),
+  ]
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Periods & Budget"
+      options={[...periodOpts, ...budgetOpts, { title: "<- Back", value: "back" }]}
+      onSelect={(item: any) => {
+        const v = item.value as string
+        if (v === "back") return showMain(api, cfg, setCfg, tick)
+        if (v.startsWith("p:")) {
+          const p = v.slice(2) as Period
+          const periods = c.footer_periods.includes(p) ? c.footer_periods.filter((x) => x !== p) : [...c.footer_periods, p]
+          const n = { ...c, footer_periods: periods }; setCfg(n); saveCfg(api, n); return showPeriodsAndBudget(api, cfg, setCfg, tick)
+        }
+        if (v === "budget:toggle") { const n = { ...cfg(), budget: { ...cfg().budget, enabled: !cfg().budget.enabled } }; setCfg(n); saveCfg(api, n); return showPeriodsAndBudget(api, cfg, setCfg, tick) }
+        if (v.startsWith("budget:")) return promptBudget(api, cfg, setCfg, v.replace("budget:", ""), tick)
+      }}
+    />
+  ))
+}
+
+function showDisplayPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  const modes: Display[] = ["total", "output", "input", "cache", "all"]
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Display Mode"
+      options={[
+        ...modes.map((m) => ({ title: `${m === cfg().display ? "[x]" : "[ ]"} ${displayLabel(m)}`, value: m })),
+        { title: "<- Back", value: "back" },
+      ]}
+      onSelect={(item: any) => {
+        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
+        const n = { ...cfg(), display: item.value as Display }; setCfg(n); saveCfg(api, n); showMain(api, cfg, setCfg, tick)
+      }}
+    />
+  ))
+}
+
+function showPeriodPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Footer Periods"
+      options={[
+        ...ALL_PERIODS.map((p) => ({ title: `${cfg().footer_periods.includes(p) ? "[x]" : "[ ]"} ${periodLabel(p)}`, value: p })),
+        { title: "<- Back", value: "back" },
+      ]}
+      onSelect={(item: any) => {
+        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
+        const c = cfg(), p = item.value as Period
+        const periods = c.footer_periods.includes(p) ? c.footer_periods.filter((x) => x !== p) : [...c.footer_periods, p]
+        const n = { ...c, footer_periods: periods }; setCfg(n); saveCfg(api, n); showPeriodPicker(api, cfg, setCfg, tick)
+      }}
+    />
+  ))
+}
+
+function showPlacementPicker(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  const placements: Placement[] = ["inline", "footer", "sidebar"]
+  const labels: Record<Placement, string> = { inline: "Inline (next to TPS · context)", footer: "Footer (line below TPS)", sidebar: "Sidebar only" }
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Placement"
+      options={[
+        ...placements.map((p) => ({ title: `${p === cfg().placement ? "[x]" : "[ ]"} ${labels[p]}`, value: p })),
+        { title: "<- Back", value: "back" },
+      ]}
+      onSelect={(item: any) => {
+        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
+        const n = { ...cfg(), placement: item.value as Placement }; setCfg(n); saveCfg(api, n); api.ui.toast({ variant: "success", message: `Placement: ${labels[item.value as Placement]}` }); showMain(api, cfg, setCfg, tick)
+      }}
+    />
+  ))
+}
+
+function showBudgetMenu(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, tick?: () => number) {
+  const c = cfg()
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogSelect
+      title="Budget Alerts"
+      options={[
+        { title: `Alerts: ${c.budget.enabled ? "On" : "Off"}`, value: "toggle" },
+        { title: `Daily tokens: ${c.budget.daily_tokens ? fmt(c.budget.daily_tokens) : "Off"}`, value: "daily_tokens" },
+        { title: `Daily cost: ${c.budget.daily_cost ? money.format(c.budget.daily_cost) : "Off"}`, value: "daily_cost" },
+        { title: `Monthly tokens: ${c.budget.monthly_tokens ? fmt(c.budget.monthly_tokens) : "Off"}`, value: "monthly_tokens" },
+        { title: `Monthly cost: ${c.budget.monthly_cost ? money.format(c.budget.monthly_cost) : "Off"}`, value: "monthly_cost" },
+        { title: "<- Back", value: "back" },
+      ]}
+      onSelect={(item: any) => {
+        if (item.value === "back") return showMain(api, cfg, setCfg, tick)
+        if (item.value === "toggle") { const n = { ...cfg(), budget: { ...cfg().budget, enabled: !cfg().budget.enabled } }; setCfg(n); saveCfg(api, n); return showBudgetMenu(api, cfg, setCfg, tick) }
+        promptBudget(api, cfg, setCfg, item.value, tick)
+      }}
+    />
+  ))
+}
+
+function promptBudget(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, field: string, tick?: () => number) {
+  const current = String((cfg().budget as any)[field] || 0)
+  api.ui.dialog.replace(() => (
+    <api.ui.DialogPrompt
+      title={field.replace(/_/g, " ")}
+      value={current}
+      placeholder="0 = disabled"
+      onConfirm={(val: string) => { const n = { ...cfg(), budget: { ...cfg().budget, [field]: parseFloat(val) || 0 } }; setCfg(n); saveCfg(api, n); showBudgetMenu(api, cfg, setCfg, tick) }}
+      onCancel={() => showBudgetMenu(api, cfg, setCfg, tick)}
     />
   ))
 }
@@ -633,214 +522,45 @@ function showBudgetMenu(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config
 function showResetConfirm(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void) {
   api.ui.dialog.replace(() => (
     <api.ui.DialogConfirm
-      title="BetterToken > Reset"
-      message="This will delete all tracked token entries. This cannot be undone."
-      onConfirm={() => {
-        writeDisk(api, EMPTY)
-        api.ui.toast({ variant: "success", message: "All token data cleared" })
-      }}
-      onCancel={() => showMain(api, cfg, setCfg)}
-    />
-  ))
-}
-
-function showPeriodDetail(api: TuiPluginApi, cfg: () => Config, setCfg: (c: Config) => void, period: string) {
-  const entries = periodFilter(readDisk(api).entries, period)
-  const input = entries.reduce((s, e) => s + e.input, 0)
-  const output = entries.reduce((s, e) => s + e.output, 0)
-  const reasoning = entries.reduce((s, e) => s + e.reasoning, 0)
-  const cread = entries.reduce((s, e) => s + e.cache_read, 0)
-  const cwrite = entries.reduce((s, e) => s + e.cache_write, 0)
-  const total = sumCost(entries)
-
-  const msg = [
-    `Input:         ${fmt(input).padStart(10)}`,
-    `Output:        ${fmt(output).padStart(10)}`,
-    `Reasoning:     ${fmt(reasoning).padStart(10)}`,
-    `Cache read:    ${fmt(cread).padStart(10)}`,
-    `Cache write:   ${fmt(cwrite).padStart(10)}`,
-    ``,
-    `Total cost:    ${money.format(total).padStart(10)}`,
-    `Messages:      ${entries.length.toString().padStart(10)}`,
-  ].join("\n")
-
-  api.ui.dialog.replace(() => (
-    <api.ui.DialogAlert
-      title={`BetterToken > ${periodLabel(period)}`}
-      message={msg}
-      onConfirm={() => showMain(api, cfg, setCfg)}
+      title="Reset all data?"
+      message="This will delete all token tracking data."
+      onConfirm={() => { writeDisk(api, EMPTY); api.ui.toast({ variant: "success", message: "Data reset" }); api.ui.dialog.clear() }}
+      onCancel={() => showMain(api, cfg, setCfg, tick)}
     />
   ))
 }
 
 function doExport(api: TuiPluginApi, cfg: () => Config) {
-  const entries = readDisk(api).entries
-  const c = cfg()
-  const lines: string[] = ["=== BetterToken Report ===", ""]
-
-  for (const p of ALL_PERIODS) {
-    const f = periodFilter(entries, p)
-    const t = aggregate(f, c.display)
-    const co = sumCost(f)
-    lines.push(`${periodLabel(p).padEnd(12)} ${fmt(t).padStart(10)} tokens   ${money.format(co).padStart(10)}`)
-  }
-
-  lines.push("")
-  lines.push(`Daily avg: ${dailyAvg(entries, c.display)}/day`)
-  lines.push(`Sparkline (7d): ${sparkline(entries, c.display)}`)
-  lines.push("")
-  lines.push("--- By Model ---")
-
-  const models = new Map<string, { input: number; output: number; cost: number }>()
-  for (const e of entries) {
-    const key = `${e.provider}/${e.model}`
-    const cur = models.get(key) ?? { input: 0, output: 0, cost: 0 }
-    cur.input += e.input
-    cur.output += e.output
-    cur.cost += e.cost
-    models.set(key, cur)
-  }
-  for (const [name, d] of [...models.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
-    lines.push(`${name.padEnd(30)} in: ${fmt(d.input).padStart(8)}  out: ${fmt(d.output).padStart(8)}  ${money.format(d.cost).padStart(10)}`)
-  }
-
-  lines.push("")
-  lines.push("--- Top Sessions ---")
-  const tops = topSessions(entries, 10, c.display)
-  for (const [sid, d] of tops) {
-    lines.push(`${sid.slice(0, 24).padEnd(26)} ${fmt(d.tokens).padStart(8)} tokens  ${money.format(d.cost).padStart(10)}  ${d.count} msgs`)
-  }
-
-  lines.push("")
-  lines.push(`Total entries: ${entries.length}`)
-  lines.push(`Generated: ${new Date().toISOString()}`)
-
-  const report = lines.join("\n")
-  copyToClipboard(report)
+  const entries = readDisk(api).entries, c = cfg()
+  const lines = ["=== BetterToken Report ===", ""]
+  for (const p of ALL_PERIODS) { const f = periodFilter(entries, p); lines.push(`${periodLabel(p)}: ${fmt(agg(f, c.display))} tokens · ${money.format(sumC(f))}`) }
+  lines.push("", `Daily avg: ${dailyAvg(entries, c.display)}/day`, `Sparkline: ${sparkline(entries, c.display)}`, "", `Total entries: ${entries.length}`, `Generated: ${new Date().toISOString()}`)
+  const b64 = Buffer.from(lines.join("\n")).toString("base64")
+  process.stdout.write(`\x1b]52;c;${b64}\x07`)
   api.ui.dialog.clear()
   api.ui.toast({ variant: "success", message: "Report copied to clipboard" })
 }
 
-// ── Footer ─────────────────────────────────────────────────────────────
+// ── Views ──────────────────────────────────────────────────────────────
 
 export function FooterView(props: { api: TuiPluginApi; cfg: () => Config; tick: () => number }) {
   const theme = () => props.api.theme.current
-
   const data = createMemo(() => {
     props.tick()
-    const entries = readDisk(props.api).entries
-    const c = props.cfg()
-    const text = formatStats(entries, c)
-    const budget = checkBudget(entries, c)
-    return { text, over: budget.over }
+    const entries = readDisk(props.api).entries, c = props.cfg()
+    return { text: formatStats(entries, c), over: checkBudget(entries, c).over }
   })
-
-  return (
-    <text fg={data().over ? "#EF4444" : theme().textMuted} wrapMode="none">
-      {data().over ? "! " : ""}{data().text}
-    </text>
-  )
+  return <text fg={data().over ? "#EF4444" : theme().textMuted} wrapMode="none">{data().over ? "! " : ""}{data().text}</text>
 }
 
 export function InlineView(props: { api: TuiPluginApi; cfg: () => Config; sid: string; tick: () => number }) {
   const data = createMemo(() => {
     props.tick()
-    const entries = readDisk(props.api).entries
-    const c = props.cfg()
+    const entries = readDisk(props.api).entries, c = props.cfg()
     const ctx = contextInfo(props.api, props.sid)
     const stats = formatStats(entries, c)
     const parts = [ctx, stats].filter(Boolean)
-    const budget = checkBudget(entries, c)
-    return { text: parts.join(" · "), over: budget.over }
+    return { text: parts.join(" · "), over: checkBudget(entries, c).over }
   })
-
   return <span style={data().over ? { fg: "#EF4444" } : {}}>{" · " + (data().over ? "! " : "") + data().text}</span>
 }
-
-// ── Plugin ─────────────────────────────────────────────────────────────
-
-const tui: TuiPlugin = (api, raw) => {
-  const initial = { ...DEFAULTS, ...(raw as Partial<Config> | undefined) }
-  const [cfg, setCfg] = createSignal<Config>(loadCfg(api, initial))
-
-  // Single shared timer for all footer components
-  const [tick, setTick] = createSignal(0)
-  const interval = setInterval(() => setTick((t) => t + 1), 2000)
-  api.lifecycle.onDispose(() => clearInterval(interval))
-
-  api.event.on("message.updated", (evt) => {
-    const msg = evt.properties.info
-    if (msg.role !== "assistant") return
-    if (!msg.time.completed) return
-    if (msg.tokens.output <= 0) return
-    record(api, msg as AssistantMessage)
-  })
-
-  const dispose = api.command.register(() => [
-    {
-      title: "BetterToken",
-      value: "bettertoken.stats",
-      description: "View token usage & settings",
-      category: "Plugin",
-      slash: { name: "bettertoken" },
-      onSelect: () => {
-        try {
-          showMain(api, cfg, setCfg)
-        } catch (e: any) {
-          api.ui.toast({ variant: "danger", message: `BetterToken error: ${e?.message ?? e}` })
-        }
-      },
-    },
-  ])
-  setTimeout(() => api.command.trigger("bettertoken.stats"), 3000)
-
-  // Detect if inline patch is installed by checking if session_usage slot is rendered.
-  // We register both slots: session_usage (inline, needs patch) and session_footer (below, native).
-  // If the patch is installed, session_usage renders inline and we skip session_footer to avoid doublon.
-  // If not patched, session_usage is silently ignored and session_footer shows the stats below.
-  // We detect the patch by checking the source file for our slot marker.
-  let patchInstalled = false
-  try {
-    const opencodeDir = path.dirname(path.dirname(api.state.path.state))
-    // Try common opencode source locations
-    const candidates = [
-      path.join(opencodeDir, "opencode-tps-meter", "current", "packages", "opencode", "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx"),
-    ]
-    // Also check bun's main module location
-    if (typeof process !== "undefined" && process.argv[1]) {
-      const srcRoot = path.resolve(path.dirname(process.argv[1]), "..")
-      candidates.push(path.join(srcRoot, "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx"))
-    }
-    for (const candidate of candidates) {
-      try {
-        const src = fs.readFileSync(candidate, "utf-8")
-        if (src.includes('name="session_usage"')) { patchInstalled = true; break }
-      } catch {}
-    }
-  } catch {}
-
-  api.slots.register({
-    order: 50,
-    slots: {
-      sidebar_footer() {
-        return <FooterView api={api} cfg={cfg} tick={tick} />
-      },
-      session_footer() {
-        // Only show session_footer if patch is NOT installed (fallback mode)
-        if (patchInstalled) return null
-        return <FooterView api={api} cfg={cfg} tick={tick} />
-      },
-      session_usage(_ctx: any, props: any) {
-        // Only active if patch is installed (inline mode)
-        return <InlineView api={api} cfg={cfg} sid={props.session_id} tick={tick} />
-      },
-    },
-  })
-}
-
-const plugin: TuiPluginModule & { id: string } = {
-  id: "bettertoken",
-  tui,
-}
-
-export default plugin
