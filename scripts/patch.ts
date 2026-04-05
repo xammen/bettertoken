@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
 /**
  * BetterToken Patcher
- * Adds session_usage and session_footer slots to OpenCode's prompt component.
- * Idempotent: safe to run multiple times. Detects if already patched.
+ *
+ * Full installer: clones OpenCode source, applies slot patch, creates launcher.
+ * Works on Windows, Mac, and Linux. Cross-platform replacement for TPS meter's
+ * Linux-only install.sh.
  *
  * Usage:
- *   bun run patch.ts              # Apply BetterToken patch
- *   bun run patch.ts --undo       # Remove BetterToken patch
- *   bun run patch.ts --uninstall-tps  # Remove TPS meter and restore stock OpenCode
+ *   bun run patch.ts                 # Install patched OpenCode
+ *   bun run patch.ts --undo          # Restore stock OpenCode
+ *   bun run patch.ts --uninstall-tps # Remove TPS meter installation
  */
 
 import fs from "node:fs"
@@ -15,164 +17,261 @@ import path from "node:path"
 import os from "node:os"
 import { execSync } from "node:child_process"
 
+const UPSTREAM_REPO = "https://github.com/anomalyco/opencode.git"
 const MARKER = "bettertoken-patch"
 const UNDO = process.argv.includes("--undo")
 const UNINSTALL_TPS = process.argv.includes("--uninstall-tps")
 
-// ── Find OpenCode installation ────────────────────────────────────────
+const HOME = os.homedir()
+const IS_WIN = process.platform === "win32"
 
-function findOpenCodeRoot(): string | null {
-  const home = os.homedir()
-  const isWin = process.platform === "win32"
+// ── Paths ─────────────────────────────────────────────────────────────
 
-  // Check common OpenCode source locations
-  const candidates: string[] = []
+const INSTALL_ROOT = IS_WIN
+  ? path.join(HOME, "AppData", "Local", "bettertoken")
+  : path.join(process.env.XDG_DATA_HOME || path.join(HOME, ".local", "share"), "bettertoken")
 
-  // opencode-tps-meter releases
-  const tpsMeterBase = isWin
-    ? path.join(home, "AppData", "Local", "opencode-tps-meter", "releases")
-    : path.join(home, ".local", "share", "opencode-tps-meter", "releases")
-  if (fs.existsSync(tpsMeterBase)) {
-    try {
-      const releases = fs.readdirSync(tpsMeterBase).sort().reverse()
-      for (const r of releases) {
-        candidates.push(path.join(tpsMeterBase, r))
-      }
-    } catch {}
-  }
+const RELEASES_DIR = path.join(INSTALL_ROOT, "releases")
+const CURRENT_LINK = path.join(INSTALL_ROOT, "current")
+const OPENCODE_BIN = path.join(HOME, ".opencode", "bin")
 
-  // Standard opencode locations
-  const standardPaths = isWin
-    ? [
-        path.join(home, "AppData", "Local", "opencode"),
-        path.join(home, ".opencode"),
-      ]
-    : [
-        path.join(home, ".local", "share", "opencode"),
-        path.join(home, ".opencode"),
-        "/usr/local/lib/opencode",
-      ]
-  candidates.push(...standardPaths)
+// ── Helpers ───────────────────────────────────────────────────────────
 
-  // Check via bun's global modules
+function run(cmd: string, cwd?: string): string {
   try {
-    const bunGlobal = isWin
-      ? path.join(home, ".bun", "install", "global", "node_modules", "opencode-ai")
-      : path.join(home, ".bun", "install", "global", "node_modules", "opencode-ai")
-    candidates.push(bunGlobal)
-  } catch {}
-
-  // Find the prompt file in each candidate
-  for (const base of candidates) {
-    const promptFile = path.join(base, "packages", "opencode", "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx")
-    if (fs.existsSync(promptFile)) {
-      return base
-    }
+    return execSync(cmd, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim()
+  } catch (e: any) {
+    return ""
   }
-
-  return null
 }
 
-function getPromptPath(root: string): string {
+function need(cmd: string, hint: string) {
+  const found = IS_WIN
+    ? run(`where ${cmd}`)
+    : run(`command -v ${cmd}`)
+  if (!found) {
+    console.error(`  Missing required command: ${cmd}`)
+    console.error(`  ${hint}`)
+    process.exit(1)
+  }
+}
+
+function detectVersion(): string {
+  // Try stock binary
+  const stockExe = path.join(OPENCODE_BIN, IS_WIN ? "opencode.exe" : "opencode")
+  if (fs.existsSync(stockExe)) {
+    const ver = run(`"${stockExe}" --version`)
+    if (ver && /^\d+\.\d+\.\d+/.test(ver)) return ver.split(" ")[0]
+  }
+  // Try stock backup
+  const stockBackup = path.join(OPENCODE_BIN, IS_WIN ? "opencode-stock.exe" : "opencode-stock")
+  if (fs.existsSync(stockBackup)) {
+    const ver = run(`"${stockBackup}" --version`)
+    if (ver && /^\d+\.\d+\.\d+/.test(ver)) return ver.split(" ")[0]
+  }
+  // Try running opencode from PATH
+  const ver = run("opencode --version")
+  if (ver && /^\d+\.\d+\.\d+/.test(ver)) return ver.split(" ")[0]
+  return ""
+}
+
+function promptPath(root: string): string {
   return path.join(root, "packages", "opencode", "src", "cli", "cmd", "tui", "component", "prompt", "index.tsx")
 }
 
-// ── Patch logic ───────────────────────────────────────────────────────
-
-function patchSource(src: string): "bettertoken" | "tps-meter" | "none" {
-  if (src.includes(MARKER)) return "bettertoken"
-  if (src.includes('name="session_usage"')) return "tps-meter"
-  return "none"
-}
+// ── Patch Logic ───────────────────────────────────────────────────────
 
 function applyPatch(src: string): string {
-  // Find the usage display line and wrap context/cost in a slot
-  // Native pattern:
-  //   {[item().context, item().cost].filter(Boolean).join(" · ")}
-  // or with TPS:
-  //   {[liveTps() ? ... : item().outputTps, item().context, item().cost]...}
-
-  // Strategy: find the <Match when={usage()}> block and inject our slots
-
-  // 1. Add session_usage slot around context/cost
-  const contextCostPattern = /(\{?\[)((?:liveTps\(\)[^,]*,\s*)?)(item\(\)\.context,\s*item\(\)\.cost\]\.filter\(Boolean\)\.join\(\s*["'][\s·]*["']\s*\))/
-
-  if (contextCostPattern.test(src)) {
-    // Split: keep TPS part outside slot, wrap context/cost in slot
-    src = src.replace(contextCostPattern, (match, bracket, tpsPart, contextCost) => {
-      if (tpsPart) {
-        // TPS meter is present: TPS stays outside, context/cost goes in slot
-        return `{[${tpsPart.replace(/,\s*$/, "")}].filter(Boolean).join(" · ")}
-                          {/* ${MARKER} */}
-                          <TuiPluginRuntime.Slot name="session_usage" mode="replace" session_id={props.sessionID ?? ""}>
-                            <span>{item().context ? \` · \${item().context}\` : ""}{item().cost ? \` · \${item().cost}\` : ""}</span>
-                          </TuiPluginRuntime.Slot>`
-      } else {
-        // No TPS meter: wrap everything in slot
-        return `{/* ${MARKER} */}
-                          <TuiPluginRuntime.Slot name="session_usage" mode="replace" session_id={props.sessionID ?? ""}>
-                            <span>${bracket}${contextCost}}</span>
-                          </TuiPluginRuntime.Slot>`
-      }
-    })
-  } else {
-    // Fallback: try simpler pattern
-    const simplePattern = /(\{)\s*\[\s*item\(\)\.context\s*,\s*item\(\)\.cost\s*\]\s*\.filter\(Boolean\)\s*\.join\([^)]+\)\s*(\})/
-    if (simplePattern.test(src)) {
-      src = src.replace(simplePattern, `{/* ${MARKER} */}
-                          <TuiPluginRuntime.Slot name="session_usage" mode="replace" session_id={props.sessionID ?? ""}>
-                            <span>{[item().context, item().cost].filter(Boolean).join(" · ")}</span>
-                          </TuiPluginRuntime.Slot>`)
-    } else {
-      console.error("Could not find context/cost pattern to patch session_usage slot.")
-      console.error("Your OpenCode version may not be compatible with this patch.")
-      process.exit(1)
-    }
+  if (src.includes(MARKER) || src.includes('name="session_usage"')) {
+    return src // Already patched
   }
 
-  // 2. Add session_footer slot
-  // Find the closing of the prompt component's main box, or after the usage section
-  // Look for a good insertion point: after the main status row section
+  // Find the context/cost display line
+  // Pattern: {[item().context, item().cost].filter(Boolean).join(" · ")}
+  const pattern = /(\{)\s*(\[)\s*(item\(\)\.context\s*,\s*item\(\)\.cost\s*\]\s*\.filter\(Boolean\)\s*\.join\(\s*["'][^"']*["']\s*\))\s*(\})/
+
+  if (!pattern.test(src)) {
+    console.error("  Could not find context/cost pattern in prompt source.")
+    console.error("  This OpenCode version may not be compatible.")
+    process.exit(1)
+  }
+
+  // Wrap context/cost in session_usage slot
+  src = src.replace(pattern, `{/* ${MARKER} */}
+                          <TuiPluginRuntime.Slot name="session_usage" mode="replace" session_id={props.sessionID ?? ""}>
+                            <span>{$2$3}</span>
+                          </TuiPluginRuntime.Slot>`)
+
+  // Add session_footer slot - find a good insertion point after the prompt area
+  // Look for the Show/box pattern near the end of the component
   if (!src.includes('name="session_footer"')) {
-    // Find the pattern where session prompt ends - look for closing tags after the usage Match
-    const footerInsertPattern = /(<\/Show>\s*\n\s*<\/box>\s*\n\s*<\/box>(?:\s*\n\s*\{\/\*.*?\*\/\})?)\s*\n(\s*<box\s)/
-    if (footerInsertPattern.test(src)) {
-      src = src.replace(footerInsertPattern, `$1
-        {/* ${MARKER}-footer */}
-        <Show when={props.sessionID}>
-          {(sid) => <TuiPluginRuntime.Slot name="session_footer" session_id={sid()} />}
-        </Show>
-$2`)
-    } else {
-      // Try alternate: insert before the last closing tags of the prompt area
-      // Just add it - the slot will be silently ignored if position isn't ideal
-      const altPattern = /(return\s*\(\s*\n\s*<box[^>]*>)/
-      if (!altPattern.test(src)) {
-        console.warn("Warning: Could not find ideal position for session_footer slot.")
-        console.warn("The session_footer slot was not added. session_usage should still work.")
+    // Insert before the last return's outermost closing tag, or after status section
+    // Find pattern: closing of the status/prompt section
+    const footerPattern = /(\s*)(return\s*\([\s\S]*?)(\s*<\/box>\s*\)\s*\}?\s*$)/m
+    
+    // Simpler approach: find the last </box> before the component's closing
+    // and insert session_footer before it
+    const lines = src.split("\n")
+    let insertIdx = -1
+    
+    // Find the line with the usage Match to insert footer after that section
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes("</box>") && i > lines.length - 20) {
+        // Check if this is near the end of the component
+        insertIdx = i
+        break
       }
+    }
+    
+    if (insertIdx > 0) {
+      const indent = "          "
+      lines.splice(insertIdx, 0,
+        `${indent}{/* ${MARKER}-footer */}`,
+        `${indent}<Show when={props.sessionID}>`,
+        `${indent}  {(sid) => <TuiPluginRuntime.Slot name="session_footer" session_id={sid()} />}`,
+        `${indent}</Show>`
+      )
+      src = lines.join("\n")
     }
   }
 
   return src
 }
 
-// undoPatch is handled by restoring from backup in main()
+// ── Create Wrappers ───────────────────────────────────────────────────
 
-// ── Uninstall TPS meter ───────────────────────────────────────────────
+function createWrappers(releaseDir: string, bunBin: string) {
+  const sourceDir = path.join(releaseDir, "packages", "opencode")
+  
+  if (!fs.existsSync(OPENCODE_BIN)) {
+    fs.mkdirSync(OPENCODE_BIN, { recursive: true })
+  }
+
+  // Backup stock binary if not already backed up
+  const stockExe = path.join(OPENCODE_BIN, IS_WIN ? "opencode.exe" : "opencode")
+  const stockBackup = path.join(OPENCODE_BIN, IS_WIN ? "opencode-stock.exe" : "opencode-stock")
+  if (fs.existsSync(stockExe) && !fs.existsSync(stockBackup)) {
+    fs.copyFileSync(stockExe, stockBackup)
+    console.log(`  Backed up stock binary: ${stockBackup}`)
+  }
+
+  if (IS_WIN) {
+    // PowerShell wrapper
+    const ps1 = path.join(OPENCODE_BIN, "opencode.ps1")
+    fs.writeFileSync(ps1, `# BetterToken patched launcher
+$env:OPENCODE_LAUNCH_CWD = (Get-Location).Path
+$SourceDir = "${sourceDir}"
+if (-not (Test-Path $SourceDir)) {
+    Write-Warning "BetterToken source not found: $SourceDir"
+    Write-Warning "Falling back to stock opencode..."
+    & "$PSScriptRoot\\opencode-stock.exe" @args
+    return
+}
+& "${bunBin}" --cwd $SourceDir --conditions=browser ./src/index.ts @args
+`)
+    console.log(`  Created: ${ps1}`)
+
+    // CMD wrapper
+    const cmd = path.join(OPENCODE_BIN, "opencode.cmd")
+    fs.writeFileSync(cmd, `@echo off
+rem BetterToken patched launcher
+set "OPENCODE_LAUNCH_CWD=%CD%"
+set "SOURCE_DIR=${sourceDir}"
+if not exist "%SOURCE_DIR%" (
+    echo BetterToken source not found: %SOURCE_DIR% 1>&2
+    echo Falling back to stock opencode... 1>&2
+    "%~dp0opencode-stock.exe" %*
+    exit /b %ERRORLEVEL%
+)
+"${bunBin}" --cwd "%SOURCE_DIR%" --conditions=browser ./src/index.ts %*
+`)
+    console.log(`  Created: ${cmd}`)
+  } else {
+    // Unix shell wrapper
+    const wrapper = path.join(OPENCODE_BIN, "opencode")
+    fs.writeFileSync(wrapper, `#!/bin/sh
+# BetterToken patched launcher
+OPENCODE_LAUNCH_CWD="$(pwd)"
+export OPENCODE_LAUNCH_CWD
+SOURCE_DIR="${sourceDir}"
+FALLBACK="${stockBackup}"
+if [ ! -d "$SOURCE_DIR" ]; then
+  if [ -x "$FALLBACK" ]; then
+    exec "$FALLBACK" "$@"
+  fi
+  echo "BetterToken source not found: $SOURCE_DIR" >&2
+  exit 1
+fi
+exec "${bunBin}" --cwd "$SOURCE_DIR" --conditions=browser ./src/index.ts "$@"
+`)
+    fs.chmodSync(wrapper, 0o755)
+    console.log(`  Created: ${wrapper}`)
+  }
+}
+
+// ── Restore Stock ─────────────────────────────────────────────────────
+
+function restoreStock() {
+  console.log("")
+  console.log("  Restoring stock OpenCode...")
+  console.log("")
+
+  if (IS_WIN) {
+    const stockBackup = path.join(OPENCODE_BIN, "opencode-stock.exe")
+    if (fs.existsSync(stockBackup)) {
+      // Restore wrappers to point to stock exe
+      const ps1 = path.join(OPENCODE_BIN, "opencode.ps1")
+      const cmd = path.join(OPENCODE_BIN, "opencode.cmd")
+      fs.writeFileSync(ps1, `& "$PSScriptRoot\\opencode.exe" @args\n`)
+      fs.writeFileSync(cmd, `@echo off\n"%~dp0opencode.exe" %*\n`)
+      // Restore the backup as the main exe
+      fs.copyFileSync(stockBackup, path.join(OPENCODE_BIN, "opencode.exe"))
+      fs.unlinkSync(stockBackup)
+      console.log("  Restored stock opencode.exe from backup")
+    } else {
+      // Just fix wrappers to point to exe
+      const ps1 = path.join(OPENCODE_BIN, "opencode.ps1")
+      const cmd = path.join(OPENCODE_BIN, "opencode.cmd")
+      if (fs.existsSync(ps1)) fs.writeFileSync(ps1, `& "$PSScriptRoot\\opencode.exe" @args\n`)
+      if (fs.existsSync(cmd)) fs.writeFileSync(cmd, `@echo off\n"%~dp0opencode.exe" %*\n`)
+      console.log("  Restored launcher wrappers")
+    }
+  } else {
+    const wrapper = path.join(OPENCODE_BIN, "opencode")
+    const stockBackup = path.join(OPENCODE_BIN, "opencode-stock")
+    if (fs.existsSync(stockBackup)) {
+      fs.renameSync(stockBackup, wrapper)
+      console.log("  Restored stock opencode from backup")
+    } else {
+      console.log("  No stock backup found. You may need to reinstall OpenCode.")
+    }
+  }
+
+  // Remove bettertoken install directory
+  if (fs.existsSync(INSTALL_ROOT)) {
+    try {
+      fs.rmSync(INSTALL_ROOT, { recursive: true, force: true })
+      console.log(`  Removed: ${INSTALL_ROOT}`)
+    } catch (e: any) {
+      console.warn(`  Could not remove ${INSTALL_ROOT}: ${e.message}`)
+    }
+  }
+
+  console.log("")
+  console.log("  Stock OpenCode restored. Restart to apply.")
+  console.log("")
+}
+
+// ── Uninstall TPS Meter ───────────────────────────────────────────────
 
 function uninstallTpsMeter() {
   console.log("")
   console.log("  Uninstalling opencode-tps-meter...")
   console.log("")
 
-  const home = os.homedir()
-  const isWin = process.platform === "win32"
-
-  // Find TPS meter install root
-  const tpsRoot = isWin
-    ? path.join(home, "AppData", "Local", "opencode-tps-meter")
-    : path.join(process.env.XDG_DATA_HOME || path.join(home, ".local", "share"), "opencode-tps-meter")
+  const tpsRoot = IS_WIN
+    ? path.join(HOME, "AppData", "Local", "opencode-tps-meter")
+    : path.join(process.env.XDG_DATA_HOME || path.join(HOME, ".local", "share"), "opencode-tps-meter")
 
   if (!fs.existsSync(tpsRoot)) {
     console.log("  opencode-tps-meter is not installed.")
@@ -181,79 +280,34 @@ function uninstallTpsMeter() {
 
   console.log(`  Found TPS meter at: ${tpsRoot}`)
 
-  // Find and restore ALL wrapper scripts that point to tps-meter
-  const wrapperCandidates = isWin
+  // Restore wrappers
+  const wrappers = IS_WIN
     ? [
-        path.join(home, ".opencode", "bin", "opencode.ps1"),
-        path.join(home, ".opencode", "bin", "opencode.cmd"),
-        path.join(home, "AppData", "Roaming", "npm", "opencode.cmd"),
-        path.join(home, "AppData", "Roaming", "npm", "opencode.ps1"),
-        path.join(home, ".bun", "bin", "opencode"),
-        path.join(home, ".bun", "bin", "opencode.cmd"),
+        path.join(OPENCODE_BIN, "opencode.ps1"),
+        path.join(OPENCODE_BIN, "opencode.cmd"),
       ]
-    : [
-        path.join(home, ".local", "bin", "opencode"),
-        path.join(home, ".opencode", "bin", "opencode"),
-      ]
+    : [path.join(HOME, ".local", "bin", "opencode")]
 
-  let restored = 0
-  for (const wrapper of wrapperCandidates) {
+  for (const wrapper of wrappers) {
     try {
       if (!fs.existsSync(wrapper)) continue
       const content = fs.readFileSync(wrapper, "utf-8")
-      if (!content.includes("opencode-tps-meter")) continue
+      if (!content.includes("opencode-tps-meter") && !content.includes("bettertoken")) continue
 
-      // This wrapper was modified by TPS meter - restore it
-      const dir = path.dirname(wrapper)
-      const ext = path.extname(wrapper)
-
-      // Find the stock opencode binary in the same directory
-      const stockBinary = fs.readdirSync(dir).find(f =>
-        f.startsWith("opencode") && (f.endsWith(".exe") || (!ext && !f.includes("."))) && !f.includes("stock") && !f.includes("tps") && f !== path.basename(wrapper)
-      )
-
-      if (ext === ".ps1") {
-        // Restore PowerShell wrapper to just call the exe
+      if (wrapper.endsWith(".ps1")) {
         fs.writeFileSync(wrapper, `& "$PSScriptRoot\\opencode.exe" @args\n`)
-        console.log(`  Restored: ${wrapper}`)
-        restored++
-      } else if (ext === ".cmd") {
-        // Restore CMD wrapper to just call the exe
+      } else if (wrapper.endsWith(".cmd")) {
         fs.writeFileSync(wrapper, `@echo off\n"%~dp0opencode.exe" %*\n`)
-        console.log(`  Restored: ${wrapper}`)
-        restored++
       } else {
-        // Unix shell script - check for stock backup
-        const stockPath = path.join(dir, "opencode-stock")
-        if (fs.existsSync(stockPath)) {
-          fs.renameSync(stockPath, wrapper)
-          console.log(`  Restored from opencode-stock: ${wrapper}`)
-          restored++
+        const stock = path.join(path.dirname(wrapper), "opencode-stock")
+        if (fs.existsSync(stock)) {
+          fs.renameSync(stock, wrapper)
         } else {
-          // Point to the exe/binary in the same dir
-          fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${dir}/opencode.exe" "$@"\n`)
+          fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${path.dirname(wrapper)}/opencode" "$@"\n`)
           fs.chmodSync(wrapper, 0o755)
-          console.log(`  Restored: ${wrapper}`)
-          restored++
         }
       }
-    } catch (e: any) {
-      console.warn(`  Could not restore ${wrapper}: ${e.message}`)
-    }
-  }
-
-  if (restored === 0) {
-    console.log("  No TPS meter wrappers found to restore.")
-  }
-
-  // Clean up stock backup files
-  for (const wrapper of wrapperCandidates) {
-    const dir = path.dirname(wrapper)
-    try {
-      const stockExe = path.join(dir, "opencode-stock.exe")
-      const stockBin = path.join(dir, "opencode-stock")
-      if (fs.existsSync(stockExe)) { fs.unlinkSync(stockExe); console.log(`  Removed backup: ${stockExe}`) }
-      if (fs.existsSync(stockBin)) { fs.unlinkSync(stockBin); console.log(`  Removed backup: ${stockBin}`) }
+      console.log(`  Restored: ${wrapper}`)
     } catch {}
   }
 
@@ -263,7 +317,7 @@ function uninstallTpsMeter() {
     console.log(`  Removed: ${tpsRoot}`)
   } catch (e: any) {
     console.error(`  Could not remove ${tpsRoot}: ${e.message}`)
-    console.error("  Try closing OpenCode first, then run this again.")
+    console.error("  Close OpenCode first, then try again.")
   }
 
   console.log("")
@@ -272,10 +326,17 @@ function uninstallTpsMeter() {
   console.log("")
 }
 
-// ── Main ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// MAIN
+// ══════════════════════════════════════════════════════════════════════
 
 if (UNINSTALL_TPS) {
   uninstallTpsMeter()
+  process.exit(0)
+}
+
+if (UNDO) {
+  restoreStock()
   process.exit(0)
 }
 
@@ -284,84 +345,132 @@ console.log("  BetterToken Patcher")
 console.log("  ───────────────────")
 console.log("")
 
-const root = findOpenCodeRoot()
-if (!root) {
-  console.error("  Could not find OpenCode installation.")
-  console.error("")
-  console.error("  Searched in common locations:")
-  console.error("    - ~/.local/share/opencode-tps-meter/releases/")
-  console.error("    - ~/.local/share/opencode/")
-  console.error("    - ~/.opencode/")
-  console.error("")
-  console.error("  Make sure OpenCode is installed before running this patcher.")
+// ── Prerequisites ─────────────────────────────────────────────────────
+
+need("git", "Install git: https://git-scm.com")
+need("bun", IS_WIN ? "Install bun: irm bun.sh/install.ps1 | iex" : "Install bun: curl -fsSL https://bun.sh/install | bash")
+
+const bunBin = IS_WIN ? run("where bun").split("\n")[0] : run("command -v bun")
+if (!bunBin) {
+  console.error("  Could not locate bun binary.")
   process.exit(1)
 }
 
-console.log(`  Found OpenCode at: ${root}`)
+// ── Detect version ────────────────────────────────────────────────────
 
-const promptPath = getPromptPath(root)
-if (!fs.existsSync(promptPath)) {
-  console.error(`  Prompt file not found: ${promptPath}`)
+const version = detectVersion()
+if (!version) {
+  console.error("  Could not detect OpenCode version.")
+  console.error("  Make sure OpenCode is installed: https://opencode.ai")
   process.exit(1)
 }
 
-const original = fs.readFileSync(promptPath, "utf-8")
+console.log(`  OpenCode version: ${version}`)
 
-const source = patchSource(original)
-
-if (UNDO) {
-  if (source === "none") {
-    console.log("  Not patched, nothing to undo.")
-    process.exit(0)
+// Check if already installed
+const releaseDir = path.join(RELEASES_DIR, version)
+if (fs.existsSync(releaseDir)) {
+  const prompt = promptPath(releaseDir)
+  if (fs.existsSync(prompt)) {
+    const src = fs.readFileSync(prompt, "utf-8")
+    if (src.includes(MARKER)) {
+      console.log("  Already patched. Nothing to do.")
+      console.log("  Use --undo to remove the patch.")
+      process.exit(0)
+    }
   }
-  if (source === "tps-meter") {
-    console.log("  This patch was applied by opencode-tps-meter, not BetterToken.")
-    console.log("  To remove it, use the TPS meter uninstaller:")
-    console.log("    curl -fsSL https://raw.githubusercontent.com/guard22/opencode-tps-meter/main/uninstall.sh | bash")
-    console.log("")
-    console.log("  Or on Windows:")
-    console.log("    irm https://raw.githubusercontent.com/guard22/opencode-tps-meter/main/uninstall.ps1 | iex")
-    process.exit(0)
-  }
-  // source === "bettertoken" → restore from backup
-  const backupPath = promptPath + ".bettertoken-backup"
-  if (fs.existsSync(backupPath)) {
-    const backup = fs.readFileSync(backupPath, "utf-8")
-    fs.writeFileSync(promptPath, backup)
-    fs.unlinkSync(backupPath)
-    console.log("  Patch removed (restored from backup).")
-    console.log("  Restart OpenCode to apply changes.")
-  } else {
-    console.log("  No backup file found. Cannot safely restore.")
-    console.log("  You may need to reinstall OpenCode to remove the patch.")
-  }
-  process.exit(0)
 }
 
-if (source !== "none") {
-  const who = source === "bettertoken" ? "BetterToken" : "opencode-tps-meter"
-  console.log(`  Already patched by ${who} (session_usage slot found).`)
-  console.log("  Nothing to do. Use --undo to remove the patch.")
-  process.exit(0)
+// ── Clone source ──────────────────────────────────────────────────────
+
+const tag = `v${version}`
+console.log(`  Cloning OpenCode ${tag}...`)
+
+fs.mkdirSync(RELEASES_DIR, { recursive: true })
+const tmpDir = path.join(INSTALL_ROOT, `.install-${Date.now()}`)
+
+try {
+  const cloneResult = run(`git clone --depth 1 --branch ${tag} "${UPSTREAM_REPO}" "${tmpDir}"`)
+  if (!fs.existsSync(path.join(tmpDir, "package.json"))) {
+    console.error(`  Failed to clone OpenCode ${tag}.`)
+    console.error("  This version may not exist. Check https://github.com/anomalyco/opencode/tags")
+    process.exit(1)
+  }
+  console.log("  Clone complete.")
+} catch (e: any) {
+  console.error(`  Clone failed: ${e.message}`)
+  process.exit(1)
 }
 
-// Backup original
-const backupPath = promptPath + ".bettertoken-backup"
-if (!fs.existsSync(backupPath)) {
-  fs.writeFileSync(backupPath, original)
-  console.log(`  Backup saved: ${backupPath}`)
+// ── Apply patch ───────────────────────────────────────────────────────
+
+const prompt = promptPath(tmpDir)
+if (!fs.existsSync(prompt)) {
+  console.error(`  Prompt file not found in source: ${prompt}`)
+  fs.rmSync(tmpDir, { recursive: true, force: true })
+  process.exit(1)
 }
 
+console.log("  Applying patch...")
+const original = fs.readFileSync(prompt, "utf-8")
 const patched = applyPatch(original)
-fs.writeFileSync(promptPath, patched)
+
+if (patched === original) {
+  console.log("  Source already has session_usage slot (from another patch).")
+} else {
+  fs.writeFileSync(prompt, patched)
+  console.log("  Patch applied: session_usage + session_footer slots added.")
+}
+
+// ── Install dependencies ──────────────────────────────────────────────
+
+console.log("  Installing dependencies (bun install)...")
+try {
+  execSync("bun install --frozen-lockfile", { cwd: tmpDir, stdio: "inherit" })
+} catch {
+  // Try without frozen lockfile
+  try {
+    execSync("bun install", { cwd: tmpDir, stdio: "inherit" })
+  } catch (e: any) {
+    console.error(`  bun install failed: ${e.message}`)
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    process.exit(1)
+  }
+}
+
+// ── Move to release directory ─────────────────────────────────────────
+
+if (fs.existsSync(releaseDir)) {
+  fs.rmSync(releaseDir, { recursive: true, force: true })
+}
+fs.renameSync(tmpDir, releaseDir)
+
+// Create/update "current" symlink/junction
+if (fs.existsSync(CURRENT_LINK)) {
+  try { fs.rmSync(CURRENT_LINK, { recursive: true, force: true }) } catch {}
+}
+try {
+  if (IS_WIN) {
+    execSync(`cmd /c mklink /J "${CURRENT_LINK}" "${releaseDir}"`, { stdio: "pipe" })
+  } else {
+    fs.symlinkSync(releaseDir, CURRENT_LINK)
+  }
+} catch {
+  // Junction/symlink failed, just write a pointer file
+  fs.writeFileSync(CURRENT_LINK + ".path", releaseDir)
+}
+
+// ── Create launcher wrappers ──────────────────────────────────────────
+
+console.log("  Creating launcher wrappers...")
+createWrappers(releaseDir, bunBin)
 
 console.log("")
-console.log("  Patch applied successfully!")
+console.log("  ✓ BetterToken patch installed!")
 console.log("")
-console.log("  Added slots:")
-console.log("    - session_usage (inline stats next to TPS)")
-console.log("    - session_footer (stats below prompt)")
+console.log(`  OpenCode ${version} is now running from patched source.`)
+console.log("  Added slots: session_usage, session_footer")
 console.log("")
 console.log("  Restart OpenCode to activate.")
-console.log("  Run with --undo to remove the patch.")
+console.log("  Use --undo to restore stock OpenCode.")
 console.log("")
