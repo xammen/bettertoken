@@ -3,6 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 $REPO = "https://raw.githubusercontent.com/xammen/bettertoken/main"
+$CACHEBUST = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $TMPDIR = Join-Path $env:TEMP "bettertoken-tps-$(Get-Random)"
 
 $bunPath = Get-Command bun -ErrorAction SilentlyContinue
@@ -13,7 +14,7 @@ if (-not $bunPath) {
 
 try {
     New-Item -ItemType Directory -Path $TMPDIR -Force | Out-Null
-    Invoke-WebRequest -Uri "$REPO/scripts/patch.ts" -OutFile "$TMPDIR\patch.ts" -UseBasicParsing
+    Invoke-WebRequest -Uri "$REPO/scripts/patch.ts?cb=$CACHEBUST" -OutFile "$TMPDIR\patch.ts" -UseBasicParsing
     & bun run "$TMPDIR\patch.ts" --uninstall-tps
 }
 finally {

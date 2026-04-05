@@ -3,6 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 $REPO = "https://raw.githubusercontent.com/xammen/bettertoken/main"
+$CACHEBUST = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $TMPDIR = Join-Path $env:TEMP "bettertoken-unpatch-$(Get-Random)"
 
 Write-Host ""
@@ -20,7 +21,7 @@ try {
     New-Item -ItemType Directory -Path $TMPDIR -Force | Out-Null
 
     Write-Host "  Downloading patcher..."
-    Invoke-WebRequest -Uri "$REPO/scripts/patch.ts" -OutFile "$TMPDIR\patch.ts" -UseBasicParsing
+    Invoke-WebRequest -Uri "$REPO/scripts/patch.ts?cb=$CACHEBUST" -OutFile "$TMPDIR\patch.ts" -UseBasicParsing
 
     Write-Host "  Removing patch..."
     Write-Host ""
