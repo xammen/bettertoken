@@ -1,0 +1,24 @@
+diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+--- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
++++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+@@ -1196,7 +1196,9 @@ export function Prompt(props: PromptProps) {
+                     <Match when={usage()}>
+                       {(item) => (
+                         <text fg={theme.textMuted} wrapMode="none">
+-                          {[item().context, item().cost].filter(Boolean).join(" · ")}
++                          <TuiPluginRuntime.Slot name="session_usage" mode="replace" session_id={props.sessionID ?? ""}>
++                            <span>{[item().context, item().cost].filter(Boolean).join(" · ")}</span>
++                          </TuiPluginRuntime.Slot>
+                         </text>
+                       )}
+                     </Match>
+@@ -1218,6 +1220,9 @@ export function Prompt(props: PromptProps) {
+               </Switch>
+             </box>
+           </Show>
++          <Show when={props.sessionID}>
++            {(sid) => <TuiPluginRuntime.Slot name="session_footer" session_id={sid()} />}
++          </Show>
+         </box>
+       </box>
+     </>
