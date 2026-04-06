@@ -1,18 +1,31 @@
 {
   "name": "opencode-bettertoken",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "Token usage tracker for OpenCode TUI - tracks cumulative consumption across sessions",
-  "main": "src/tui.tsx",
-  "files": ["src"],
-  "keywords": ["opencode", "opencode-plugin", "tokens", "usage", "tracker", "tui"],
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/xammen/bettertoken"
+  "description": "Token usage tracker for OpenCode TUI",
+  "exports": {
+    "./tui": "./tui.tsx"
+  },
+  "files": [
+    "tui.tsx",
+    "logic.tsx"
+  ],
+  "engines": {
+    "opencode": ">=1.3.14"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*",
-    "@opencode-ai/sdk": "*"
-  }
+    "@opencode-ai/sdk": "*",
+    "@opentui/core": "*",
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tokens",
+    "usage",
+    "tracker"
+  ],
+  "license": "MIT"
 }
